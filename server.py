@@ -7875,27 +7875,52 @@ def dispatch(method, path, params, body, conn):
     if method == "POST" and path == "/admin/purge-data":
         if not current_user or current_user["role"] not in ("admin", "executive"):
             return {"status": 403, "body": {"error": "Forbidden"}}
+        # Disable FK checks during purge to avoid constraint ordering issues
+        conn.execute("PRAGMA foreign_keys = OFF")
         tables_to_purge = [
-            "production_log_summary", "qa_audits", "dispatch_runs", "contractor_assignments",
-            "truck_work_orders", "delivery_log", "close_days", "inventory",
-            "post_production_log", "qa_defects", "qa_inspections",
-            "pause_logs", "setup_logs", "production_logs", "session_workers", "production_sessions",
-            "schedule_entries", "notification_log",
-            "order_items", "orders"
+            # Driver / delivery child tables
+            "delivery_photos", "delivery_run_costs", "delivery_run_stages",
+            "driver_incidents", "driver_logbook", "driver_shifts",
+            "delivery_addresses",
+            # Dispatch
+            "contractor_assignments", "dispatch_runs", "truck_work_orders", "delivery_log",
+            # Production child tables
+            "production_log_summary", "production_logs", "session_workers", "production_sessions",
+            "pause_logs", "setup_logs",
+            # QA
+            "qa_defects", "qa_inspections", "qa_audits",
+            # Post-production
+            "post_production_log",
+            # Planning / scheduling
+            "schedule_entries", "station_capacity", "close_days",
+            # Drawings, inventory, notifications
+            "drawing_files", "inventory", "notification_log",
+            # Order tables last
+            "order_items", "orders",
+            # Accounting sync logs (order-related)
+            "accounting_sync_log",
+            # Login attempts (not config, but transient)
+            "login_attempts"
         ]
-        # Order matters — delete child tables before parent tables
-        # audit_log last (insert purge record after)
+        purged = []
         for t in tables_to_purge:
             try:
                 conn.execute(f"DELETE FROM {t}")
+                purged.append(t)
             except Exception:
-                pass  # Table may not exist
+                pass  # Table may not exist in this schema version
         # Clear audit_log but record the purge
-        conn.execute("DELETE FROM audit_log")
+        try:
+            conn.execute("DELETE FROM audit_log")
+            purged.append("audit_log")
+        except Exception:
+            pass
         conn.execute("INSERT INTO audit_log (user_id, action, entity_type, details) VALUES (?, 'purge_all_data', 'system', ?)",
-            [current_user["id"], json.dumps({"tables_cleared": tables_to_purge + ["audit_log"]})])
+            [current_user["id"], json.dumps({"tables_cleared": purged})])
+        # Re-enable FK checks
+        conn.execute("PRAGMA foreign_keys = ON")
         conn.commit()
-        return {"status": 200, "body": {"success": True, "message": "All production data purged", "tables_cleared": tables_to_purge + ["audit_log"]}}
+        return {"status": 200, "body": {"success": True, "message": "All production data purged", "tables_cleared": purged}}
 
     # ----- SEND TEST EMAIL -----
     if method == "POST" and path == "/admin/email-test":
