@@ -2465,7 +2465,11 @@ if not JWT_SECRET:
     print("Set JWT_SECRET in your environment before starting the server.")
     print("Example: export JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))')\n")
     # Use a fallback so the server can still start (login will fail without a real secret)
-    JWT_SECRET = "CHANGE_ME_set_JWT_SECRET_env_var"
+    import sys
+    print("\n[FATAL] JWT_SECRET environment variable is not set. Server cannot start securely.")
+    print("Set JWT_SECRET in your environment before starting the server.")
+    print("Example: export JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))')\n")
+    sys.exit(1)
 JWT_EXPIRY_SECONDS = 86400 * 7  # 7 days
 
 
@@ -3038,6 +3042,8 @@ def dispatch(method, path, params, body, conn):
     if method == "POST" and path == "/users":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
+        if current_user["role"] not in ("executive", "office"):
+            return {"status": 403, "body": {"error": "Admin role required to manage users"}}
         for f in ["full_name", "role"]:
             if not body.get(f):
                 return {"status": 400, "body": {"error": f"Field '{f}' is required"}}
@@ -3064,6 +3070,8 @@ def dispatch(method, path, params, body, conn):
         if method == "PUT":
             if not current_user:
                 return {"status": 401, "body": {"error": "Authentication required"}}
+            if current_user["role"] not in ("executive", "office"):
+                return {"status": 403, "body": {"error": "Admin role required to manage users"}}
             row = conn.execute("SELECT * FROM users WHERE id=?", [uid]).fetchone()
             if not row:
                 return {"status": 404, "body": {"error": "User not found"}}
@@ -3484,7 +3492,7 @@ def dispatch(method, path, params, body, conn):
     if method == "GET" and path == "/docking/board":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
-        zone_filter = qs_dict.get("zone_id", [None])[0]
+        zone_filter = params.get("zone_id")
         base_q = """
             SELECT oi.*, o.order_number, o.client_id, c.company_name as client_name,
                    s.name as sku_name, z.name as zone_name, z.code as zone_code,
@@ -3774,7 +3782,7 @@ def dispatch(method, path, params, body, conn):
         if not row:
             return {"status": 404, "body": {"error": "Order item not found"}}
         fields, vals = [], []
-        for f in ["sku_id", "sku_code", "product_name", "quantity", "produced_quantity", "unit_price", "line_total", "status", "zone_id", "station_id", "scheduled_date", "eta_date", "drawing_number", "special_instructions", "requested_delivery_date"]:
+        for f in ["sku_id", "sku_code", "product_name", "quantity", "produced_quantity", "unit_price", "line_total", "zone_id", "station_id", "scheduled_date", "eta_date", "drawing_number", "special_instructions", "requested_delivery_date"]:
             if f in body:
                 fields.append(f"{f}=?"); vals.append(body[f])
         if not fields:
@@ -3904,6 +3912,8 @@ def dispatch(method, path, params, body, conn):
             row = conn.execute("SELECT * FROM schedule_entries WHERE id=?", [sid]).fetchone()
             return {"status": 200, "body": row_to_dict(row)}
         if method == "DELETE":
+            if not current_user:
+                return {"status": 401, "body": {"error": "Authentication required"}}
             row = conn.execute("SELECT id FROM schedule_entries WHERE id=?", [sid]).fetchone()
             if not row:
                 return {"status": 404, "body": {"error": "Schedule entry not found"}}
@@ -4209,6 +4219,8 @@ def dispatch(method, path, params, body, conn):
 
     m = match("/production/sessions/:id/workers/:wid", path)
     if m and method == "DELETE":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         sid = int(m["id"])
         wid = int(m["wid"])
         conn.execute("UPDATE session_workers SET scan_off_time=CURRENT_TIMESTAMP, is_active=0 WHERE session_id=? AND user_id=?", [sid, wid])
@@ -4326,6 +4338,8 @@ def dispatch(method, path, params, body, conn):
     if m and method == "PUT":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
+        if current_user["role"] not in ("qa_lead", "production_manager", "executive", "office"):
+            return {"status": 403, "body": {"error": "QA lead or manager role required to approve inspections"}}
         iid = int(m["id"])
         insp = conn.execute("SELECT * FROM qa_inspections WHERE id=?", [iid]).fetchone()
         if not insp:
@@ -4704,11 +4718,11 @@ def dispatch(method, path, params, body, conn):
         zone_id = params.get("zone_id")
         where, vals = [], []
         if q:
-            where.append("(s.sku_code LIKE ? OR s.name LIKE ?)"); vals.extend([f"%{q}%", f"%{q}%"])
+            where.append("(s.code LIKE ? OR s.name LIKE ?)"); vals.extend([f"%{q}%", f"%{q}%"])
         if zone_id:
             where.append("s.zone_id=?"); vals.append(zone_id)
         where_str = " AND ".join(where) if where else "1=1"
-        rows = rows_to_list(conn.execute(f"SELECT s.*, z.name as zone_name FROM skus s LEFT JOIN zones z ON z.id=s.zone_id WHERE {where_str} ORDER BY s.sku_code LIMIT 50", vals).fetchall())
+        rows = rows_to_list(conn.execute(f"SELECT s.*, z.name as zone_name FROM skus s LEFT JOIN zones z ON z.id=s.zone_id WHERE {where_str} ORDER BY s.code LIMIT 50", vals).fetchall())
         return {"status": 200, "body": rows}
 
     # ----- DISPATCH -----
@@ -4803,7 +4817,7 @@ def dispatch(method, path, params, body, conn):
         if not row:
             return {"status": 404, "body": {"error": "Delivery log entry not found"}}
         fields, vals = [], []
-        for f in ["expected_date", "actual_date", "truck_id", "delivery_type", "status", "load_sequence", "notes"]:
+        for f in ["expected_date", "actual_date", "truck_id", "delivery_type", "status", "load_sequence", "notes", "estimated_minutes"]:
             if f in body:
                 fields.append(f"{f}=?"); vals.append(body[f])
         if not fields:
@@ -4823,6 +4837,57 @@ def dispatch(method, path, params, body, conn):
             caps = rows_to_list(conn.execute("SELECT * FROM truck_capacity_config WHERE truck_id=? ORDER BY day_of_week", [t["id"]]).fetchall())
             t["capacity_config"] = {str(c["day_of_week"]): c for c in caps}
         return {"status": 200, "body": result}
+
+    if method == "POST" and path == "/trucks":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        if current_user["role"] not in ("executive", "office", "dispatch"):
+            return {"status": 403, "body": {"error": "Insufficient role"}}
+        name = body.get("name")
+        if not name:
+            return {"status": 400, "body": {"error": "Truck name is required"}}
+        try:
+            cur = conn.execute(
+                "INSERT INTO trucks (name, rego, capacity_pallets, notes) VALUES (?,?,?,?)",
+                [name, body.get("rego"), body.get("capacity_pallets", 0), body.get("notes")]
+            )
+            conn.commit()
+            row = conn.execute("SELECT * FROM trucks WHERE id=?", [cur.lastrowid]).fetchone()
+            return {"status": 201, "body": row_to_dict(row)}
+        except Exception as e:
+            return {"status": 409, "body": {"error": str(e)}}
+
+    m = match("/trucks/:id", path)
+    if m and method == "PUT":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        if current_user["role"] not in ("executive", "office", "dispatch"):
+            return {"status": 403, "body": {"error": "Insufficient role"}}
+        tid = int(m["id"])
+        row = conn.execute("SELECT id FROM trucks WHERE id=?", [tid]).fetchone()
+        if not row:
+            return {"status": 404, "body": {"error": "Truck not found"}}
+        fields, vals = [], []
+        for f in ["name", "rego", "capacity_pallets", "notes", "is_active"]:
+            if f in body:
+                fields.append(f"{f}=?"); vals.append(body[f])
+        if not fields:
+            return {"status": 400, "body": {"error": "No updatable fields"}}
+        fields.append("updated_at=CURRENT_TIMESTAMP")
+        vals.append(tid)
+        conn.execute(f"UPDATE trucks SET {', '.join(fields)} WHERE id=?", vals)
+        conn.commit()
+        row = conn.execute("SELECT * FROM trucks WHERE id=?", [tid]).fetchone()
+        return {"status": 200, "body": row_to_dict(row)}
+    if m and method == "DELETE":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        if current_user["role"] not in ("executive", "office"):
+            return {"status": 403, "body": {"error": "Insufficient role"}}
+        tid = int(m["id"])
+        conn.execute("UPDATE trucks SET is_active=0 WHERE id=?", [tid])
+        conn.commit()
+        return {"status": 200, "body": {"message": "Truck deactivated"}}
 
     # ----- DISPATCH PLANNING (date-range, truck-based) -----
     if method == "GET" and path == "/dispatch-planning":
@@ -5767,6 +5832,8 @@ def dispatch(method, path, params, body, conn):
             row = conn.execute("SELECT * FROM delivery_addresses WHERE id=?", [da_id]).fetchone()
             return {"status": 200, "body": row_to_dict(row)}
         if method == "DELETE":
+            if not current_user:
+                return {"status": 401, "body": {"error": "Authentication required"}}
             conn.execute("UPDATE delivery_addresses SET is_active=0 WHERE id=?", [da_id])
             conn.commit()
             return {"status": 200, "body": {"ok": True}}
@@ -5969,6 +6036,42 @@ def dispatch(method, path, params, body, conn):
             return {"status": 201, "body": row_to_dict(row)}
         except Exception as e:
             return {"status": 409, "body": {"error": str(e)}}
+
+    m = match("/skus/:id", path)
+    if m and method == "PUT":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        if current_user["role"] not in ("executive", "office", "planner"):
+            return {"status": 403, "body": {"error": "Insufficient role"}}
+        sku_id = int(m["id"])
+        row = conn.execute("SELECT id FROM skus WHERE id=?", [sku_id]).fetchone()
+        if not row:
+            return {"status": 404, "body": {"error": "SKU not found"}}
+        fields, vals = [], []
+        for f in ["code", "name", "drawing_number", "labour_cost", "material_cost", "sell_price", "zone_id", "myob_uid", "is_active"]:
+            if f in body:
+                val = body[f].upper() if f == "code" else body[f]
+                fields.append(f"{f}=?"); vals.append(val)
+        if not fields:
+            return {"status": 400, "body": {"error": "No updatable fields"}}
+        fields.append("updated_at=CURRENT_TIMESTAMP")
+        vals.append(sku_id)
+        try:
+            conn.execute(f"UPDATE skus SET {', '.join(fields)} WHERE id=?", vals)
+            conn.commit()
+            row = conn.execute("SELECT * FROM skus WHERE id=?", [sku_id]).fetchone()
+            return {"status": 200, "body": row_to_dict(row)}
+        except Exception as e:
+            return {"status": 409, "body": {"error": str(e)}}
+    if m and method == "DELETE":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        if current_user["role"] not in ("executive", "office"):
+            return {"status": 403, "body": {"error": "Insufficient role"}}
+        sku_id = int(m["id"])
+        conn.execute("UPDATE skus SET is_active=0 WHERE id=?", [sku_id])
+        conn.commit()
+        return {"status": 200, "body": {"message": "SKU deactivated"}}
 
     # ----- STATS -----
     if method == "GET" and path == "/stats/production":
@@ -7203,8 +7306,13 @@ def dispatch(method, path, params, body, conn):
         # Update the parent order status too
         dl_order = conn.execute("SELECT order_id FROM delivery_log WHERE id=?", [dl_id]).fetchone()
         if dl_order and dl_order[0]:
+            order_id = dl_order[0]
             conn.execute("UPDATE orders SET status=?, dispatched_at=? WHERE id=?",
-                         [final_status, datetime.now(timezone.utc).isoformat(), dl_order[0]])
+                         [final_status, datetime.now(timezone.utc).isoformat(), order_id])
+            # Update order items to match delivery status
+            conn.execute("UPDATE order_items SET status=? WHERE order_id=? AND status IN ('F', 'dispatched')",
+                         [final_status, order_id])
+            update_kanban_statuses(conn, order_id)
         conn.commit()
         return {"status": 200, "body": costs}
 
@@ -9667,13 +9775,13 @@ def dispatch(method, path, params, body, conn):
 
         # Build kanban groups
         groups = {
-            "red_pending": {"label": "Pending Stock", "color": "#dc2626", "items": []},
-            "amber_docking": {"label": "In Docking", "color": "#f59e0b", "items": []},
-            "amber_production": {"label": "In Production", "color": "#f59e0b", "items": []},
-            "green_planning": {"label": "Ready / Planning", "color": "#22c55e", "items": []},
-            "green_dispatch": {"label": "Ready to Dispatch", "color": "#16a34a", "items": []},
-            "blue_dispatched": {"label": "Dispatched", "color": "#2563eb", "items": []},
-            "red_delivered": {"label": "Delivered", "color": "#dc2626", "items": []}
+            "pending_stock": {"label": "Pending Stock", "color": "#dc2626", "items": []},
+            "in_docking": {"label": "In Docking", "color": "#f59e0b", "items": []},
+            "in_production": {"label": "In Production", "color": "#f59e0b", "items": []},
+            "ready_planning": {"label": "Ready / Planning", "color": "#22c55e", "items": []},
+            "ready_to_dispatch": {"label": "Ready to Dispatch", "color": "#16a34a", "items": []},
+            "dispatched": {"label": "Dispatched", "color": "#2563eb", "items": []},
+            "delivered": {"label": "Delivered", "color": "#dc2626", "items": []}
         }
 
         for item in items:
@@ -9692,19 +9800,19 @@ def dispatch(method, path, params, body, conn):
             ist = item.get("item_status", "T")
 
             if ds in ("delivered", "collected") or item.get("delivered_date"):
-                groups["red_delivered"]["items"].append(entry)
+                groups["delivered"]["items"].append(entry)
             elif ds in ("loaded", "in_transit") or item.get("dispatched_at"):
-                groups["blue_dispatched"]["items"].append(entry)
+                groups["dispatched"]["items"].append(entry)
             elif ist == "F":
-                groups["green_dispatch"]["items"].append(entry)
+                groups["ready_to_dispatch"]["items"].append(entry)
             elif ist == "P":
-                groups["green_planning"]["items"].append(entry)
+                groups["ready_planning"]["items"].append(entry)
             elif ist == "R":
-                groups["amber_production"]["items"].append(entry)
+                groups["in_production"]["items"].append(entry)
             elif ist == "C":
-                groups["amber_docking"]["items"].append(entry)
+                groups["in_docking"]["items"].append(entry)
             else:  # T
-                groups["red_pending"]["items"].append(entry)
+                groups["pending_stock"]["items"].append(entry)
 
         # Add counts
         for k, g in groups.items():

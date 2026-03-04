@@ -63,7 +63,7 @@ const PinLogin = ({ onLogin }) => {
       const data = await api('/driver/pin-login', { method: 'POST', body: JSON.stringify({ pin: p }) });
       if (data.token) {
         // Verify this user has chainsaw access
-        if (data.user && (data.user.role === 'chainsaw' || data.user.role === 'executive' || data.user.role === 'admin' || data.user.role === 'floor_worker')) {
+        if (data.user && (data.user.role === 'chainsaw_operator' || data.user.role === 'executive' || data.user.role === 'office' || data.user.role === 'floor_worker')) {
           onLogin(data);
         } else {
           setError('Access denied for this role'); setPin('');

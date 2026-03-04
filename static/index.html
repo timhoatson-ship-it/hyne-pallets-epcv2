@@ -316,12 +316,12 @@ const LoginPage = ({ onLogin }) => {
 // SIDEBAR
 // ═══════════════════════════════════════════════════════════════
 const NAV_ITEMS = [
-  { id: 'dashboard', label: 'Dashboard', icon: 'LayoutDashboard', roles: ['executive','admin','office','planner','qa','dispatch','ops_manager'] },
+  { id: 'dashboard', label: 'Dashboard', icon: 'LayoutDashboard', roles: ['executive','admin','office','planner','qa_lead','dispatch','ops_manager'] },
   { id: 'office', label: 'Office', icon: 'Briefcase', roles: ['executive','admin','office','ops_manager'] },
   { id: 'planning', label: 'Planning', icon: 'CalendarDays', roles: ['executive','admin','planner','ops_manager','production_manager'] },
   { id: 'allocation', label: 'Station Alloc', icon: 'Users', roles: ['production_manager','executive','admin','ops_manager','planner'] },
   { id: 'floor', label: 'Production', icon: 'Factory', roles: ['floor_worker','team_leader','production_manager','executive','admin','ops_manager','planner'] },
-  { id: 'qa', label: 'QA', icon: 'ShieldCheck', roles: ['qa','team_leader','executive','admin','ops_manager'] },
+  { id: 'qa', label: 'QA', icon: 'ShieldCheck', roles: ['qa_lead','team_leader','executive','admin','ops_manager'] },
   { id: 'postproduction', label: 'Post-Production', icon: 'Flame', roles: ['executive','admin','production_manager','qa_lead','office','planner','ops_manager'] },
   { id: 'productionlog', label: 'Production Log', icon: 'ClipboardList', roles: ['executive','admin','production_manager','planner','office','ops_manager'] },
   { id: 'dispatch', label: 'Dispatch', icon: 'Truck', roles: ['dispatch','executive','admin','ops_manager'] },
@@ -4348,6 +4348,8 @@ const QADashboard = ({ token }) => {
   }, [token]);
 
   useEffect(() => { load(); }, [load]);
+  // Auto-refresh QA every 30 seconds
+  useEffect(() => { const iv = setInterval(() => load(), 30000); return () => clearInterval(iv); }, [load]);
 
   const addDefect = async () => {
     if (!inspecting) return;
@@ -5203,6 +5205,8 @@ const DispatchDashboard = ({ token }) => {
   };
 
   useEffect(() => { loadRef.current(); }, [dayOffset, numDays, activeTruck, token, subPage]);
+  // Auto-refresh dispatch every 30 seconds
+  useEffect(() => { const iv = setInterval(() => { if (loadRef.current) loadRef.current(); }, 30000); return () => clearInterval(iv); }, []);
   const reload = () => loadRef.current();
 
   // Assign truck to a delivery_log entry
@@ -6983,7 +6987,7 @@ const AdminPage = ({ token }) => {
     } catch(e) { toast(e.message,'error'); }
   };
 
-  const ROLES = ['executive','admin','office','planner','floor_worker','team_leader','qa','dispatch','ops_manager','yardsman','chainsaw_operator','driver'];
+  const ROLES = ['executive','office','planner','production_manager','floor_worker','team_leader','qa_lead','dispatch','ops_manager','yardsman','chainsaw_operator','driver','yard'];
   const STATION_TYPES = ['machine','table','centre','station'];
   const CAPACITY_METRICS = ['units_per_machine','man_hours_per_table','man_hours_per_centre','man_hours_per_station'];
 
@@ -8791,7 +8795,7 @@ const TimberFinanceTab = ({ token, user }) => {
 
   const exportMYOB = async () => {
     try {
-      const res = await fetch('/api/timber/valuation/export-myob', { headers: { 'Authorization': 'Bearer ' + token } });
+      const res = await fetch('/api/timber/reports/export/myob', { headers: { 'Authorization': 'Bearer ' + token } });
       if (!res.ok) { toast('Export failed', 'error'); return; }
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
