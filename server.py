@@ -7875,8 +7875,11 @@ def dispatch(method, path, params, body, conn):
     if method == "POST" and path == "/admin/purge-data":
         if not current_user or current_user["role"] not in ("admin", "executive"):
             return {"status": 403, "body": {"error": "Forbidden"}}
-        # Disable FK checks during purge to avoid constraint ordering issues
-        conn.execute("PRAGMA foreign_keys = OFF")
+        # Use a dedicated connection with FK checks disabled
+        pconn = sqlite3.connect(DB_PATH, timeout=30)
+        pconn.execute("PRAGMA foreign_keys = OFF")
+        pconn.execute("PRAGMA journal_mode = WAL")
+        pconn.execute("PRAGMA busy_timeout = 10000")
         tables_to_purge = [
             # Driver / delivery child tables
             "delivery_photos", "delivery_run_costs", "delivery_run_stages",
@@ -7900,26 +7903,29 @@ def dispatch(method, path, params, body, conn):
             # Accounting sync logs (order-related)
             "accounting_sync_log",
             # Login attempts (not config, but transient)
-            "login_attempts"
+            "login_attempts",
+            # Audit log
+            "audit_log"
         ]
         purged = []
         for t in tables_to_purge:
             try:
-                conn.execute(f"DELETE FROM {t}")
+                pconn.execute(f"DELETE FROM {t}")
+                pconn.commit()
                 purged.append(t)
             except Exception:
-                pass  # Table may not exist in this schema version
-        # Clear audit_log but record the purge
+                try:
+                    pconn.rollback()
+                except Exception:
+                    pass
+        # Record the purge action
         try:
-            conn.execute("DELETE FROM audit_log")
-            purged.append("audit_log")
+            pconn.execute("INSERT INTO audit_log (user_id, action, entity_type, details) VALUES (?, 'purge_all_data', 'system', ?)",
+                [current_user["id"], json.dumps({"tables_cleared": purged})])
+            pconn.commit()
         except Exception:
             pass
-        conn.execute("INSERT INTO audit_log (user_id, action, entity_type, details) VALUES (?, 'purge_all_data', 'system', ?)",
-            [current_user["id"], json.dumps({"tables_cleared": purged})])
-        # Re-enable FK checks
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.commit()
+        pconn.close()
         return {"status": 200, "body": {"success": True, "message": "All production data purged", "tables_cleared": purged}}
 
     # ----- SEND TEST EMAIL -----
