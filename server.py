@@ -3188,6 +3188,31 @@ def dispatch(method, path, params, body, conn):
             conn.commit()
             return {"status": 200, "body": {"message": "User deactivated"}}
 
+    # ----- CHANGE PASSWORD (self-service + admin reset) -----
+    if method == "POST" and path == "/admin/change-password":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        target_user_id = body.get("user_id", current_user["id"])
+        new_password = body.get("new_password", "").strip()
+        current_password = body.get("current_password", "").strip()
+        if not new_password or len(new_password) < 6:
+            return {"status": 400, "body": {"error": "New password must be at least 6 characters"}}
+        # Self-change: verify current password
+        if target_user_id == current_user["id"]:
+            row = conn.execute("SELECT password_hash FROM users WHERE id=?", [current_user["id"]]).fetchone()
+            if row and not check_password(row[0], current_password):
+                return {"status": 403, "body": {"error": "Current password is incorrect"}}
+        else:
+            # Admin resetting another user's password
+            if current_user["role"] not in ("executive", "office"):
+                return {"status": 403, "body": {"error": "Only executive/office can reset other users' passwords"}}
+        new_hash = hash_password(new_password)
+        conn.execute("UPDATE users SET password_hash=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [new_hash, target_user_id])
+        conn.commit()
+        target_name = conn.execute("SELECT full_name FROM users WHERE id=?", [target_user_id]).fetchone()
+        log_audit(conn, current_user["id"], "CHANGE_PASSWORD", "users", target_user_id, None, {"changed_by": current_user["full_name"]})
+        return {"status": 200, "body": {"message": f"Password updated for {target_name[0] if target_name else 'user'}"}}
+
     # ----- ZONES -----
     if method == "GET" and path == "/zones":
         if not current_user:
