@@ -7,6 +7,7 @@ Wraps the existing CGI handler logic for deployment on Railway/Render/etc.
 import os
 import sys
 import json
+import logging
 import base64
 import hashlib
 import re
