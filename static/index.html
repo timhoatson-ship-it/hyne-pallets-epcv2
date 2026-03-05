@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Hyne Pallets — Manufacturing Management</title>
-  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
@@ -4615,7 +4615,7 @@ const fmtMinutes = (mins) => {
 const KANBAN_INFO = {
   red_pending:       { color:'#dc2626', label:'Pending Stock',      desc:'Stock not ready / not assigned to docking' },
   amber_production:  { color:'#f59e0b', label:'In Production',      desc:'Currently in production' },
-  amber_qa:          { color:'#f59e0b', label:'In QA',              desc:'Post-production, pre-dispatch QA', border:'2px solid #92400e' },
+  amber_docking:     { color:'#f59e0b', label:'In Docking',           desc:'Docking / cut list stage', border:'2px solid #92400e' },
   green_planning:    { color:'#22c55e', label:'Planning',           desc:'Inventory available but NOT yet assigned to dispatch' },
   green_dispatch:    { color:'#16a34a', label:'Ready to Dispatch',  desc:'QA complete, assigned to a delivery run' },
   blue:              { color:'#2563eb', label:'Dispatched',         desc:'Truck loaded, dispatch confirmed by office' },

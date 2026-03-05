@@ -1,0 +1,9 @@
+{
+  "name": "Hyne Pallets - Driver",
+  "short_name": "Driver",
+  "start_url": "/driver.html",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#07324C",
+  "icons": []
+}

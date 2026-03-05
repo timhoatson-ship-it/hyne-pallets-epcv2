@@ -10,7 +10,6 @@ import json
 import base64
 import hashlib
 import re
-import traceback
 import sqlite3
 import hmac
 import time
@@ -23,7 +22,10 @@ from flask_cors import CORS
 # ---------------------------------------------------------------------------
 
 app = Flask(__name__, static_folder="static", static_url_path="")
-CORS(app)
+CORS(app, origins=[
+    os.environ.get("CORS_ORIGIN", "*"),  # Set CORS_ORIGIN env var in Railway
+    "https://web-production-8779e.up.railway.app",
+])
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
 
@@ -105,13 +107,20 @@ def send_email_smtp(to_email, subject, body_text, body_html=None):
         server = smtplib.SMTP(cfg["smtp_host"], int(cfg.get("smtp_port", 587)))
         if cfg.get("smtp_use_tls", 1):
             server.starttls()
-        server.login(cfg["smtp_user"], cfg.get("smtp_password", ""))
+        server.login(cfg["smtp_user"], _smtp_decrypt(cfg.get("smtp_password", "")))
         server.send_message(msg)
         server.quit()
         return (True, None)
     except Exception as e:
         return (False, str(e))
 
+
+
+def send_email_smtp_async(*args, **kwargs):
+    """Send email in background thread to avoid blocking HTTP response."""
+    import threading
+    t = threading.Thread(target=send_email_smtp, args=args, kwargs=kwargs, daemon=True)
+    t.start()
 
 def log_and_send_notification(conn, order_id, notification_type, recipient_email, subject, body_text, body_html=None):
     """Insert notification record and attempt SMTP delivery."""
@@ -124,7 +133,8 @@ def log_and_send_notification(conn, order_id, notification_type, recipient_email
     notif_id = cur.lastrowid
 
     # Attempt SMTP delivery
-    success, err = send_email_smtp(recipient_email, subject, body_text, body_html)
+    send_email_smtp_async(recipient_email, subject, body_text, body_html)
+    success, err = True, None  # Async — assume queued OK
     if success:
         conn.execute("UPDATE notification_log SET status='sent', delivery_status='delivered', delivered_at=?, attempted_at=? WHERE id=?",
             [now, now, notif_id])
@@ -933,8 +943,8 @@ CREATE TABLE IF NOT EXISTS timber_supplier_approvals (
         conn.commit()
 
     if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        admin_pw = hash_password("admin123")
-        default_pw = hash_password("password123")
+        admin_pw = hash_password(os.environ.get("ADMIN_DEFAULT_PW", "CHANGE_ME_ON_DEPLOY"))
+        default_pw = hash_password(os.environ.get("DEFAULT_USER_PW", "CHANGE_ME_ON_DEPLOY"))
         users = [
             ("tim@hynepallets.com.au", admin_pw, None, "tim.hoatson", "Tim Hoatson", "executive"),
             ("sarah@hynepallets.com.au", default_pw, None, "sarah.office", "Sarah Office", "office"),
@@ -1353,8 +1363,8 @@ def migrate_db():
                     c.execute("INSERT INTO qa_inspections (id, order_item_id, session_id, inspection_type, batch_size, passed, inspector_id, notes, inspected_at) VALUES (?,?,?,?,?,?,?,?,?)",
                         [row_dict.get('id'), row_dict.get('order_item_id'), row_dict.get('session_id'), row_dict.get('inspection_type'), row_dict.get('batch_size'), row_dict.get('passed'), row_dict.get('inspector_id'), row_dict.get('notes'), row_dict.get('inspected_at')])
             conn.commit()
-        except:
-            pass
+        except Exception as _mig_err:
+            logging.debug('Migration note: %s', _mig_err)
 
     # =========================================================================
     # DRIVER APP TABLES & MIGRATIONS
@@ -1636,8 +1646,8 @@ def migrate_db():
         try:
             c.execute(col_sql)
             conn.commit()
-        except:
-            pass
+        except Exception as _mig_err:
+            logging.debug('Migration note: %s', _mig_err)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS delivery_photos (
@@ -1763,8 +1773,8 @@ def migrate_db():
         try:
             c.execute(col_sql)
             conn.commit()
-        except:
-            pass
+        except Exception as _mig_err:
+            logging.debug('Migration note: %s', _mig_err)
 
     # --- Block 3: Add columns to trackmyride_config for enhanced config ---
     for col_sql in [
@@ -1776,8 +1786,8 @@ def migrate_db():
         try:
             c.execute(col_sql)
             conn.commit()
-        except:
-            pass
+        except Exception as _mig_err:
+            logging.debug('Migration note: %s', _mig_err)
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS trackmyride_events (
@@ -1847,8 +1857,8 @@ def migrate_db():
         try:
             c.execute(col_sql)
             conn.commit()
-        except:
-            pass
+        except Exception as _mig_err:
+            logging.debug('Migration note: %s', _mig_err)
 
     # --- Block 4: expand notification_type CHECK constraint ---
     try:
@@ -2452,6 +2462,44 @@ def migrate_db():
 
     conn.commit()
 
+    # ----- Performance Indexes (Bug #15 fix) -----
+    try:
+        index_stmts = [
+            "CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)",
+            "CREATE INDEX IF NOT EXISTS idx_order_items_status ON order_items(status)",
+            "CREATE INDEX IF NOT EXISTS idx_order_items_zone_id ON order_items(zone_id)",
+            "CREATE INDEX IF NOT EXISTS idx_order_items_sku_id ON order_items(sku_id)",
+            "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
+            "CREATE INDEX IF NOT EXISTS idx_orders_client_id ON orders(client_id)",
+            "CREATE INDEX IF NOT EXISTS idx_schedule_entries_zone_id ON schedule_entries(zone_id)",
+            "CREATE INDEX IF NOT EXISTS idx_schedule_entries_station_id ON schedule_entries(station_id)",
+            "CREATE INDEX IF NOT EXISTS idx_schedule_entries_date ON schedule_entries(scheduled_date)",
+            "CREATE INDEX IF NOT EXISTS idx_schedule_entries_item ON schedule_entries(order_item_id)",
+            "CREATE INDEX IF NOT EXISTS idx_production_sessions_zone ON production_sessions(zone_id)",
+            "CREATE INDEX IF NOT EXISTS idx_production_sessions_station ON production_sessions(station_id)",
+            "CREATE INDEX IF NOT EXISTS idx_production_sessions_status ON production_sessions(status)",
+            "CREATE INDEX IF NOT EXISTS idx_production_logs_session ON production_logs(session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_session_workers_session ON session_workers(session_id)",
+            "CREATE INDEX IF NOT EXISTS idx_session_workers_user ON session_workers(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_delivery_log_order ON delivery_log(order_id)",
+            "CREATE INDEX IF NOT EXISTS idx_delivery_log_truck ON delivery_log(truck_id)",
+            "CREATE INDEX IF NOT EXISTS idx_delivery_log_date ON delivery_log(expected_date)",
+            "CREATE INDEX IF NOT EXISTS idx_qa_inspections_item ON qa_inspections(order_item_id)",
+            "CREATE INDEX IF NOT EXISTS idx_stations_zone ON stations(zone_id)",
+            "CREATE INDEX IF NOT EXISTS idx_skus_zone ON skus(zone_id)",
+            "CREATE INDEX IF NOT EXISTS idx_skus_code ON skus(code)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)",
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id)",
+            "CREATE INDEX IF NOT EXISTS idx_timber_packs_species ON timber_packs(species_id)",
+            "CREATE INDEX IF NOT EXISTS idx_timber_packs_status ON timber_packs(status)",
+            "CREATE INDEX IF NOT EXISTS idx_dispatch_runs_date ON dispatch_runs(planned_date)",
+        ]
+        for stmt in index_stmts:
+            conn.execute(stmt)
+        conn.commit()
+    except Exception as e:
+        logging.info("Index creation note: %s", e)
+
     conn.close()
 
 
@@ -2471,6 +2519,31 @@ if not JWT_SECRET:
     print("Example: export JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))')\n")
     sys.exit(1)
 JWT_EXPIRY_SECONDS = 86400 * 7  # 7 days
+
+def _smtp_encrypt(plaintext):
+    """Simple XOR obfuscation with JWT_SECRET — not true encryption but prevents casual DB reads."""
+    if not plaintext:
+        return ""
+    key = (JWT_SECRET or "fallback").encode()
+    encrypted = bytearray()
+    for i, ch in enumerate(plaintext.encode()):
+        encrypted.append(ch ^ key[i % len(key)])
+    import base64
+    return "ENC:" + base64.b64encode(bytes(encrypted)).decode()
+
+def _smtp_decrypt(stored):
+    """Reverse the XOR obfuscation."""
+    if not stored or not stored.startswith("ENC:"):
+        return stored  # Legacy plaintext — return as-is
+    import base64
+    key = (JWT_SECRET or "fallback").encode()
+    encrypted = base64.b64decode(stored[4:])
+    decrypted = bytearray()
+    for i, ch in enumerate(encrypted):
+        decrypted.append(ch ^ key[i % len(key)])
+    return decrypted.decode()
+
+
 
 
 def make_token(user_id, role):
@@ -2700,7 +2773,7 @@ def _check_low_stock(conn, spec_id):
                     "SELECT email FROM timber_alert_recipients WHERE is_active=1"
                 ).fetchall()
                 for r in recipients:
-                    send_email_smtp(
+                    send_email_smtp_async(
                         r[0],
                         f"Low Stock Alert: {desc}",
                         f"Timber stock alert:\n{desc}\nCurrent: {current:.2f} {unit}\nThreshold: {threshold} {unit}"
@@ -2840,6 +2913,14 @@ def health_check():
 # Static file serving
 # ---------------------------------------------------------------------------
 
+
+@app.after_request
+def add_security_headers(response):
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    return response
+
 @app.route("/")
 def serve_index():
     return send_from_directory("static", "index.html")
@@ -2857,7 +2938,7 @@ def serve_static(path):
 def compute_kanban_status(order_status, item_status, has_inventory=False, has_dispatch_run=False, is_dispatched=False, is_delivered=False):
     """Compute Kanban traffic light status.
     Returns: (color_key, label) tuple
-    color_key: red_pending, amber_production, amber_qa, green_planning, green_dispatch, blue, red_delivered
+    color_key: red_pending, amber_production, amber_docking, green_planning, green_dispatch, blue, red_delivered
     """
     if is_delivered:
         return ('red_delivered', 'Delivered')
@@ -2872,14 +2953,14 @@ def compute_kanban_status(order_status, item_status, has_inventory=False, has_di
     if item_status in ('P', 'R'):
         return ('amber_production', 'In Production')
     if item_status == 'C':
-        return ('amber_qa', 'In QA')
+        return ('amber_docking', 'In Docking')
     return ('red_pending', 'Pending Stock')
 
 
 KANBAN_COLORS = {
     'red_pending':   {'color': '#dc2626', 'label': 'Pending Stock',      'hex': '#dc2626'},
     'amber_production': {'color': '#f59e0b', 'label': 'In Production',   'hex': '#f59e0b'},
-    'amber_qa':      {'color': '#f59e0b', 'label': 'In QA',              'hex': '#f59e0b'},
+    'amber_docking':  {'color': '#f59e0b', 'label': 'In Docking',         'hex': '#f59e0b'},
     'green_planning':{'color': '#22c55e', 'label': 'Planning',           'hex': '#22c55e'},
     'green_dispatch':{'color': '#16a34a', 'label': 'Ready to Dispatch',  'hex': '#16a34a'},
     'blue':          {'color': '#2563eb', 'label': 'Dispatched',         'hex': '#2563eb'},
@@ -2902,12 +2983,12 @@ def update_kanban_statuses(conn, order_id):
                CASE WHEN inv.units_on_hand > inv.units_allocated AND inv.units_on_hand > 0 THEN 1 ELSE 0 END as has_inventory
         FROM order_items oi
         LEFT JOIN orders o ON o.id = oi.order_id
-        LEFT JOIN delivery_log dl ON dl.order_id = o.id
+        LEFT JOIN (SELECT order_id, MAX(id) as id, MAX(run_id) as run_id, status FROM delivery_log GROUP BY order_id) dl ON dl.order_id = o.id
         LEFT JOIN inventory inv ON inv.sku_id = oi.sku_id
         WHERE oi.order_id = ?
     """, [order_id]).fetchall()
 
-    worst_color_rank = {'red_pending': 0, 'red_delivered': 6, 'amber_qa': 1, 'amber_production': 2, 'green_planning': 3, 'green_dispatch': 4, 'blue': 5}
+    worst_color_rank = {'red_pending': 0, 'red_delivered': 6, 'amber_docking': 1, 'amber_production': 2, 'green_planning': 3, 'green_dispatch': 4, 'blue': 5}
     order_kanban = 'blue'
     order_kanban_rank = 99
 
@@ -3002,16 +3083,16 @@ def dispatch(method, path, params, body, conn):
         pin = body.get("pin", "").strip()
         if not username or not pin:
             return {"status": 400, "body": {"error": "username and pin required"}}
-        allowed, remaining = check_rate_limit(conn, f"pin:{pin}")
+        allowed, remaining = check_rate_limit(conn, f"pin:{pin}:{request.remote_addr}")
         if not allowed:
             return {"status": 429, "body": {"error": "Too many attempts. Try again later."}}
         row = conn.execute("SELECT * FROM users WHERE username=? AND pin=? AND is_active=1", [username, pin]).fetchone()
         if not row:
-            record_login_attempt(conn, f"pin:{pin}", False)
+            record_login_attempt(conn, f"pin:{pin}:{request.remote_addr}", False)
             return {"status": 401, "body": {"error": "Invalid username or PIN"}}
         user = row_to_dict(row)
         token = make_token(user["id"], user["role"])
-        record_login_attempt(conn, f"pin:{pin}", True)
+        record_login_attempt(conn, f"pin:{pin}:{request.remote_addr}", True)
         user.pop("password_hash", None)
         user.pop("pin", None)
         return {"status": 200, "body": {"token": token, "user": user}}
@@ -3029,6 +3110,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- USERS -----
     if method == "GET" and path == "/users":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         rows = conn.execute("SELECT * FROM users ORDER BY full_name").fetchall()
@@ -3106,6 +3189,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- ZONES -----
     if method == "GET" and path == "/zones":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         zones = rows_to_list(conn.execute("SELECT * FROM zones WHERE is_active=1 ORDER BY name").fetchall())
         for z in zones:
             z["stations"] = rows_to_list(conn.execute("SELECT * FROM stations WHERE zone_id=? AND is_active=1 ORDER BY name", [z["id"]]).fetchall())
@@ -3165,6 +3250,8 @@ def dispatch(method, path, params, body, conn):
 
     m = match("/zones/:id/stations", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         zone = conn.execute("SELECT id FROM zones WHERE id=?", [int(m["id"])]).fetchone()
         if not zone:
             return {"status": 404, "body": {"error": "Zone not found"}}
@@ -3193,6 +3280,8 @@ def dispatch(method, path, params, body, conn):
             return {"status": 409, "body": {"error": str(e)}}
 
     if method == "GET" and path == "/stations":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["is_active=1"], []
         if params.get("zone_id"):
             where.append("zone_id=?"); vals.append(params["zone_id"])
@@ -3252,6 +3341,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- ORDERS -----
     if method == "GET" and path == "/orders":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         status = params.get("status")
         client_id = params.get("client_id")
         where, vals = ["1=1"], []
@@ -3373,7 +3464,7 @@ def dispatch(method, path, params, body, conn):
     if m and method == "PUT":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
-        allowed = ['planner','production_manager','floor_worker','executive','office','admin','ops_manager']
+        allowed = ['planner','production_manager','floor_worker','executive','office','ops_manager']
         if current_user.get("role") not in allowed:
             return {"status": 403, "body": {"error": "Permission denied — requires planner, production manager, or floor team leader"}}
         oid = int(m["id"])
@@ -3383,7 +3474,7 @@ def dispatch(method, path, params, body, conn):
         force = body.get("force", False)
         if force:
             # Force-complete: promote T and C items to R (planners/managers only)
-            force_allowed = ['planner','production_manager','executive','admin','ops_manager']
+            force_allowed = ['planner','production_manager','executive','office','ops_manager']
             if current_user.get("role") not in force_allowed:
                 return {"status": 403, "body": {"error": "Force docking complete requires planner, production_manager, ops_manager, executive, or admin role"}}
             conn.execute(
@@ -3443,6 +3534,8 @@ def dispatch(method, path, params, body, conn):
     if method == "GET" and path == "/docking/log":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         # All items that have been through docking (status C or beyond, or docking_completed_at set)
         # Order by last action date descending (uses docking_completed_at, updated_at, or created_at)
         logs = rows_to_list(conn.execute("""
@@ -3474,6 +3567,8 @@ def dispatch(method, path, params, body, conn):
     if method == "GET" and path == "/docking/jobs":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         # Items currently in docking status (C) — jobs the chainsaw worker can complete
         jobs = rows_to_list(conn.execute("""
             SELECT oi.id, oi.order_id, oi.sku_code, oi.quantity, oi.status,
@@ -3490,6 +3585,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"jobs": jobs}}
 
     if method == "GET" and path == "/docking/board":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         zone_filter = params.get("zone_id")
@@ -3580,7 +3677,8 @@ def dispatch(method, path, params, body, conn):
         # For terminal statuses (dispatched/delivered/collected), set directly on order
         # For pipeline statuses (P/F), also update item statuses to stay in sync
         if new_status in ('dispatched', 'delivered', 'collected'):
-            conn.execute("UPDATE orders SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [new_status, oid])
+            extra_fields = ", dispatched_at=CURRENT_TIMESTAMP" if new_status == 'dispatched' else ""
+            conn.execute(f"UPDATE orders SET status=?, updated_at=CURRENT_TIMESTAMP{extra_fields} WHERE id=?", [new_status, oid])
             if new_status == 'dispatched':
                 conn.execute("UPDATE order_items SET status='dispatched' WHERE order_id=? AND status='F'", [oid])
             conn.commit()
@@ -3795,6 +3893,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- SCHEDULE -----
     if method == "GET" and path == "/schedule":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("date_from"):
             where.append("se.scheduled_date >= ?"); vals.append(params["date_from"])
@@ -3971,6 +4071,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- PRODUCTION FLOOR OVERVIEW -----
     if method == "GET" and path == "/production/floor-overview":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         zones = rows_to_list(conn.execute("SELECT * FROM zones WHERE is_active=1 ORDER BY id").fetchall())
         result = []
         for zone in zones:
@@ -4023,6 +4125,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- PRODUCTION -----
     if method == "GET" and path == "/production/sessions":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         status = params.get("status", "active")
         where, vals = ["ps.status=?"], [status]
         if params.get("zone_id"):
@@ -4062,6 +4166,8 @@ def dispatch(method, path, params, body, conn):
 
     m = match("/production/sessions/:id", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         sid = int(m["id"])
         session = conn.execute("SELECT * FROM production_sessions WHERE id=?", [sid]).fetchone()
         if not session:
@@ -4283,6 +4389,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- QA -----
     if method == "GET" and path == "/qa/inspections":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("order_item_id"):
             where.append("qi.order_item_id=?"); vals.append(params["order_item_id"])
@@ -4358,6 +4466,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- POST-PRODUCTION PROCESSES -----
     if method == "GET" and path == "/post-production/processes":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         rows = conn.execute("SELECT * FROM post_production_processes WHERE is_active=1 ORDER BY name").fetchall()
         return {"status": 200, "body": rows_to_list(rows)}
 
@@ -4370,6 +4480,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 201, "body": row_to_dict(conn.execute("SELECT * FROM post_production_processes WHERE id=?", [cur.lastrowid]).fetchone())}
 
     if method == "GET" and path == "/post-production/log":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("order_item_id"):
             where.append("ppl.order_item_id=?"); vals.append(params["order_item_id"])
@@ -4418,6 +4530,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- QA AUDITS (management spot checks) -----
     if method == "GET" and path == "/qa/audits":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("zone_id"):
             where.append("qa.zone_id=?"); vals.append(params["zone_id"])
@@ -4458,6 +4572,8 @@ def dispatch(method, path, params, body, conn):
 
     # GET /production/worker-station-data
     if method == "GET" and path == "/production/worker-station-data":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         station_id = params.get("station_id")
@@ -4508,6 +4624,8 @@ def dispatch(method, path, params, body, conn):
     # GET /production/combined-progress/:item_id
     m = match("/production/combined-progress/:item_id", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         item_id = int(m["item_id"])
         sessions = rows_to_list(conn.execute("""
             SELECT ps.*, st.name as station_name, z.name as zone_name
@@ -4523,6 +4641,8 @@ def dispatch(method, path, params, body, conn):
 
     # GET /production/shift-summary
     if method == "GET" and path == "/production/shift-summary":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         station_id = params.get("station_id")
         zone_id = params.get("zone_id")
         if not station_id:
@@ -4625,6 +4745,8 @@ def dispatch(method, path, params, body, conn):
 
     # GET /production/drawings (list, no file_data)
     if method == "GET" and path == "/production/drawings":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("sku_id"):
             where.append("sku_id=?"); vals.append(params["sku_id"])
@@ -4636,6 +4758,8 @@ def dispatch(method, path, params, body, conn):
     # GET /production/drawings/:id (single drawing with file_data)
     m = match("/production/drawings/:id", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         did = int(m["id"])
         row = conn.execute("SELECT * FROM drawing_files WHERE id=?", [did]).fetchone()
         if not row:
@@ -4668,6 +4792,8 @@ def dispatch(method, path, params, body, conn):
     # GET /production/session-summary/:id
     m = match("/production/session-summary/:id", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         sid = int(m["id"])
         session = row_to_dict(conn.execute("""
             SELECT ps.*, oi.sku_code, oi.product_name, oi.quantity as order_qty, oi.drawing_number,
@@ -4714,6 +4840,8 @@ def dispatch(method, path, params, body, conn):
 
     # GET /skus/search (SKU autocomplete)
     if method == "GET" and path == "/skus/search":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         q = params.get("q", "")
         zone_id = params.get("zone_id")
         where, vals = [], []
@@ -4727,6 +4855,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DISPATCH -----
     if method == "GET" and path == "/dispatch":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         date = params.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         deliveries = rows_to_list(conn.execute("SELECT dl.*, o.order_number, c.company_name as client_name, t.name as truck_name FROM delivery_log dl LEFT JOIN orders o ON o.id=dl.order_id LEFT JOIN clients c ON c.id=o.client_id LEFT JOIN trucks t ON t.id=dl.truck_id WHERE dl.expected_date=? ORDER BY dl.load_sequence, dl.id", [date]).fetchall())
         # Collections: orders that are delivery_type='collection' AND have at least one item with status='F'
@@ -4786,6 +4916,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"date": date, "deliveries": deliveries, "collections": collections, "incoming_production": incoming}}
 
     if method == "GET" and path == "/delivery-log":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("order_id"):
             where.append("dl.order_id=?"); vals.append(params["order_id"])
@@ -4831,6 +4963,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRUCKS -----
     if method == "GET" and path == "/trucks":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         rows = conn.execute("SELECT * FROM trucks WHERE is_active=1 ORDER BY id").fetchall()
         result = rows_to_list(rows)
         for t in result:
@@ -4891,6 +5025,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DISPATCH PLANNING (date-range, truck-based) -----
     if method == "GET" and path == "/dispatch-planning":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         date_from = params.get("date_from", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         date_to = params.get("date_to", date_from)
         truck_id = params.get("truck_id")  # optional filter
@@ -5079,6 +5215,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DISPATCH PLANNING V2 (new Excel-style grid endpoint) -----
     if method == "GET" and path == "/dispatch-planning-v2":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         date_from = params.get("date_from", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         date_to = params.get("date_to", date_from)
 
@@ -5142,7 +5280,7 @@ def dispatch(method, path, params, body, conn):
             kanban_map = {
                 "red_pending":   {"color": "#dc2626", "label": "Pending Stock"},
                 "amber_production": {"color": "#f59e0b", "label": "In Production"},
-                "amber_qa":      {"color": "#f59e0b", "label": "In QA"},
+                "amber_docking":  {"color": "#f59e0b", "label": "In Docking"},
                 "green_planning":{"color": "#22c55e", "label": "Planning"},
                 "green_dispatch":{"color": "#16a34a", "label": "Ready to Dispatch"},
                 "blue":          {"color": "#2563eb", "label": "Dispatched"},
@@ -5184,7 +5322,7 @@ def dispatch(method, path, params, body, conn):
                 d["items"] = []; d["progress"] = "0/0"; d["all_finished"] = False; d["sku_summary"] = ""
             kanban_key = d.get("order_kanban") or "red_pending"
             km = {"red_pending":{"color":"#dc2626","label":"Pending Stock"},"amber_production":{"color":"#f59e0b","label":"In Production"},
-                  "amber_qa":{"color":"#f59e0b","label":"In QA"},"green_planning":{"color":"#22c55e","label":"Planning"},
+                  "amber_docking":{"color":"#f59e0b","label":"In Docking"},"green_planning":{"color":"#22c55e","label":"Planning"},
                   "green_dispatch":{"color":"#16a34a","label":"Ready to Dispatch"},"blue":{"color":"#2563eb","label":"Dispatched"},
                   "red_delivered":{"color":"#dc2626","label":"Delivered"}}.get(kanban_key, {"color":"#dc2626","label":"Pending Stock"})
             d["kanban_color"] = km["color"]; d["kanban_label"] = km["label"]
@@ -5234,7 +5372,7 @@ def dispatch(method, path, params, body, conn):
                         kanban_key = e.get("order_kanban") or "red_pending"
                         km_entry = {"red_pending":{"color":"#dc2626","label":"Pending Stock"},
                                     "amber_production":{"color":"#f59e0b","label":"In Production"},
-                                    "amber_qa":{"color":"#f59e0b","label":"In QA"},
+                                    "amber_docking":{"color":"#f59e0b","label":"In Docking"},
                                     "green_planning":{"color":"#22c55e","label":"Planning"},
                                     "green_dispatch":{"color":"#16a34a","label":"Ready to Dispatch"},
                                     "blue":{"color":"#2563eb","label":"Dispatched"},
@@ -5326,6 +5464,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DISPATCH RUN SHEET (all trucks, all days, load order) -----
     if method == "GET" and path == "/dispatch-runsheet":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         date_from = params.get("date_from", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         date_to = params.get("date_to", date_from)
 
@@ -5416,6 +5556,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRUCK WORK ORDERS -----
     if method == "GET" and path == "/truck-work-orders":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("truck_id"):
             where.append("truck_id=?"); vals.append(int(params["truck_id"]))
@@ -5473,6 +5615,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRUCK CAPACITY CONFIG -----
     if method == "GET" and path == "/truck-capacity":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if params.get("truck_id"):
             rows = conn.execute("SELECT * FROM truck_capacity_config WHERE truck_id=? ORDER BY day_of_week", [int(params["truck_id"])]).fetchall()
         else:
@@ -5497,6 +5641,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": row_to_dict(row)}
 
     if method == "GET" and path == "/truck-capacity-check":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         truck_id = params.get("truck_id")
         check_date = params.get("date")
         if not truck_id or not check_date:
@@ -5537,6 +5683,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DISPATCH RUNS (multi-run support) -----
     if method == "GET" and path == "/dispatch-runs":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("truck_id"):
             where.append("truck_id=?"); vals.append(int(params["truck_id"]))
@@ -5760,6 +5908,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- GET KANBAN STATUSES for orders -----
     if method == "GET" and path == "/kanban-statuses":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         order_ids = params.get("order_ids", "")
         if order_ids:
             ids = [int(x) for x in order_ids.split(",") if x.strip()]
@@ -5784,6 +5934,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DELIVERY ADDRESSES -----
     if method == "GET" and path == "/delivery-addresses":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["is_active=1"], []
         if params.get("client_id"):
             where.append("client_id=?"); vals.append(int(params["client_id"]))
@@ -5871,6 +6023,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- CONTRACTOR ASSIGNMENTS -----
     if method == "GET" and path == "/contractor-assignments":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["status!='cancelled'"], []
         if params.get("delivery_log_id"):
             where.append("delivery_log_id=?"); vals.append(int(params["delivery_log_id"]))
@@ -5925,6 +6079,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- CLIENTS -----
     if method == "GET" and path == "/clients":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         is_active = params.get("is_active", "1")
         rows = conn.execute("SELECT * FROM clients WHERE is_active=? ORDER BY company_name", [is_active]).fetchall()
         return {"status": 200, "body": rows_to_list(rows)}
@@ -6012,6 +6168,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- SKUS -----
     if method == "GET" and path == "/skus":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["is_active=1"], []
         if params.get("zone_id"):
             where.append("zone_id=?"); vals.append(params["zone_id"])
@@ -6075,6 +6233,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- STATS -----
     if method == "GET" and path == "/stats/production":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         zone_stats = rows_to_list(conn.execute("SELECT z.name as zone_name, z.code, COUNT(ps.id) as sessions_today, COALESCE(SUM(ps.produced_quantity),0) as units_produced FROM zones z LEFT JOIN production_sessions ps ON ps.zone_id=z.id AND DATE(ps.start_time)=? WHERE z.is_active=1 GROUP BY z.id, z.name, z.code ORDER BY z.name", [today]).fetchall())
         # Order-level pipeline (for backward compat)
@@ -6092,6 +6252,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"date": today, "zone_stats": zone_stats, "pipeline": pipeline, "item_pipeline": item_pipeline, "active_sessions": active_sessions, "today_completed_value": round(today_value, 2)}}
 
     if method == "GET" and path == "/stats/orders":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         rows = conn.execute("SELECT status, COUNT(*) as count, COALESCE(SUM(total_value),0) as total_value FROM orders GROUP BY status ORDER BY status").fetchall()
         status_labels = {"T": "New/Tendered", "C": "Cut List", "R": "Ready", "P": "In Production", "F": "Finished", "dispatched": "Dispatched", "delivered": "Delivered", "collected": "Collected"}
         result = []
@@ -6103,6 +6265,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- ACCOUNTING -----
     if method == "GET" and path == "/accounting/config":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         row = conn.execute("SELECT * FROM accounting_config LIMIT 1").fetchone()
         if not row:
             return {"status": 200, "body": {}}
@@ -6154,12 +6318,16 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"message": "Sync triggered", "provider": provider, "status": "success"}}
 
     if method == "GET" and path == "/accounting/sync-log":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         limit = safe_int(params.get("limit"), 50)
         rows = conn.execute("SELECT * FROM accounting_sync_log ORDER BY synced_at DESC LIMIT ?", [limit]).fetchall()
         return {"status": 200, "body": rows_to_list(rows)}
 
     # ----- NOTIFICATIONS -----
     if method == "GET" and path == "/notifications":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("order_id"):
             where.append("order_id=?"); vals.append(params["order_id"])
@@ -6184,6 +6352,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- AUDIT LOG -----
     if method == "GET" and path == "/audit-log":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("entity_type"):
             where.append("entity_type=?"); vals.append(params["entity_type"])
@@ -6195,6 +6365,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- INVENTORY -----
     if method == "GET" and path == "/inventory/on-hand":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         # Returns sku_id -> on_hand count map
         rows = conn.execute(
             "SELECT sku_id, SUM(units_on_hand) as on_hand FROM inventory WHERE sku_id IS NOT NULL GROUP BY sku_id"
@@ -6203,6 +6375,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": result}
 
     if method == "GET" and path == "/inventory":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         rows = conn.execute("""
             SELECT inv.*, s.code as sku_code, s.name as sku_name, s.zone_id
             FROM inventory inv JOIN skus s ON s.id=inv.sku_id
@@ -6231,6 +6405,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- STATION CAPACITY -----
     if method == "GET" and path == "/station-capacity":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         station_id_filter = params.get("station_id")
         if station_id_filter:
             row = conn.execute(
@@ -6285,6 +6461,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- LABOUR CONFIG -----
     if method == "GET" and path == "/labour-config":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         default_rate = conn.execute("SELECT * FROM target_labour_rates WHERE is_default=1 LIMIT 1").fetchone()
         user_rates = rows_to_list(conn.execute(
             "SELECT tlr.*, u.full_name, u.username FROM target_labour_rates tlr LEFT JOIN users u ON u.id=tlr.user_id WHERE tlr.is_default=0 ORDER BY tlr.id"
@@ -6453,6 +6631,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- CAPACITY CHECK (pre-drop validation) -----
     if method == "GET" and path == "/capacity-check":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         station_id = params.get("station_id")
         scheduled_date = params.get("scheduled_date")
         additional_qty = safe_int(params.get("additional_quantity"), 0)
@@ -6483,6 +6663,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- PLANNING / VIKING -----
     if method == "GET" and path == "/planning/viking":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         week_start = params.get("week_start")
         if not week_start:
             # Default to current Monday
@@ -6614,6 +6796,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- PLANNING / HANDMADE -----
     if method == "GET" and path == "/planning/handmade":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         week_start = params.get("week_start")
         if not week_start:
             today = datetime.now(timezone.utc)
@@ -6824,9 +7008,13 @@ def dispatch(method, path, params, body, conn):
         }}
 
     if method == "GET" and path == "/planning/dtl":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         return _planning_zone("DTL")
 
     if method == "GET" and path == "/planning/crates":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         return _planning_zone("CRT")
 
     # ----- DTL BATCH LOG -----
@@ -6851,6 +7039,8 @@ def dispatch(method, path, params, body, conn):
     # ----- SHARED WO PROGRESS (cross-station live count) -----
     m = match("/production/shared-progress/:item_id", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         item_id = int(m["item_id"])
         item = conn.execute("SELECT * FROM order_items WHERE id=?", [item_id]).fetchone()
         if not item:
@@ -6875,6 +7065,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- PRODUCTION LOG SUMMARY -----
     if method == "GET" and path == "/production-log":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         zone_id = params.get("zone_id")
         date_from = params.get("date_from", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         date_to = params.get("date_to", date_from)
@@ -6902,7 +7094,9 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DEBUG (secured — exec only) -----
     if method == "GET" and path == "/debug":
-        if not user or user['role'] not in ('executive', 'office'):
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        if not current_user or current_user['role'] not in ('executive', 'office'):
             return {"status": 403, "body": {"error": "Executive access required"}}
         return {"status": 200, "body": {"db_path": DB_PATH, "db_exists": os.path.exists(DB_PATH), "cwd": os.getcwd()}}
 
@@ -6920,16 +7114,16 @@ def dispatch(method, path, params, body, conn):
         pin = body.get("pin", "").strip()
         if not pin or len(pin) != 6:
             return {"status": 400, "body": {"error": "6-digit PIN required"}}
-        allowed, remaining = check_rate_limit(conn, f"pin:{pin}")
+        allowed, remaining = check_rate_limit(conn, f"pin:{pin}:{request.remote_addr}")
         if not allowed:
             return {"status": 429, "body": {"error": "Too many attempts. Try again later."}}
         row = conn.execute("SELECT * FROM users WHERE pin=? AND is_active=1", [pin]).fetchone()
         if not row:
-            record_login_attempt(conn, f"pin:{pin}", False)
+            record_login_attempt(conn, f"pin:{pin}:{request.remote_addr}", False)
             return {"status": 401, "body": {"error": "Invalid PIN"}}
         user = row_to_dict(row)
         token = make_token(user["id"], user["role"])
-        record_login_attempt(conn, f"pin:{pin}", True)
+        record_login_attempt(conn, f"pin:{pin}:{request.remote_addr}", True)
         # Get default truck for this driver
         truck = conn.execute("SELECT * FROM trucks WHERE driver_name=? AND is_active=1",
                              [user["full_name"]]).fetchone()
@@ -7022,6 +7216,8 @@ def dispatch(method, path, params, body, conn):
     if method == "GET" and path == "/driver/shift":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         shift = conn.execute(
             "SELECT ds.*, t.name as truck_name, t.rego as truck_rego FROM driver_shifts ds LEFT JOIN trucks t ON t.id=ds.truck_id WHERE ds.driver_id=? AND ds.status='active'",
             [current_user["id"]]).fetchone()
@@ -7033,6 +7229,8 @@ def dispatch(method, path, params, body, conn):
     if method == "GET" and path == "/driver/shift-history":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         rows = conn.execute(
             "SELECT ds.*, t.name as truck_name FROM driver_shifts ds LEFT JOIN trucks t ON t.id=ds.truck_id WHERE ds.driver_id=? ORDER BY ds.created_at DESC LIMIT 30",
             [current_user["id"]]).fetchall()
@@ -7040,6 +7238,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- GET DRIVER LOAD (deliveries for truck today) -----
     if method == "GET" and path == "/driver/load":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         truck_id = params.get("truck_id")
@@ -7082,6 +7282,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- GET UPCOMING RUNS -----
     if method == "GET" and path == "/driver/upcoming":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         truck_id = params.get("truck_id")
@@ -7155,6 +7357,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- GET STAGES FOR DELIVERY -----
     if method == "GET" and path == "/driver/stages":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         delivery_log_id = params.get("delivery_log_id")
         shift_id = params.get("shift_id")
         if delivery_log_id:
@@ -7318,6 +7522,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRUCK FINANCE CONFIG -----
     if method == "GET" and path == "/truck-finance":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         truck_id = params.get("truck_id")
         if truck_id:
             row = conn.execute("SELECT tf.*, t.name as truck_name FROM truck_finance_config tf LEFT JOIN trucks t ON t.id=tf.truck_id WHERE tf.truck_id=?",
@@ -7354,6 +7560,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DELIVERY COSTS -----
     if method == "GET" and path == "/delivery-costs":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         dl_id = params.get("delivery_log_id")
         if dl_id:
             row = conn.execute("SELECT * FROM delivery_run_costs WHERE delivery_log_id=?", [dl_id]).fetchone()
@@ -7366,6 +7574,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRUCKS LIST (enhanced for driver app) -----
     if method == "GET" and path == "/driver/trucks":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         rows = conn.execute("SELECT * FROM trucks WHERE is_active=1 ORDER BY id").fetchall()
         return {"status": 200, "body": rows_to_list(rows)}
 
@@ -7389,6 +7599,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- GET DRIVER RUN SHEET -----
     if method == "GET" and path == "/driver/runsheet":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         truck_id = params.get("truck_id")
@@ -7425,6 +7637,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- RUNSHEET V2 — grouped by dispatch runs -----
     if method == "GET" and path == "/driver/runsheet-v2":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         truck_id = params.get("truck_id")
@@ -7522,6 +7736,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- SAFETY CHECKLIST ITEMS -----
     if method == "GET" and path == "/driver/safety-checklist-items":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         rows = conn.execute("SELECT * FROM safety_checklist_items WHERE is_active=1 ORDER BY sort_order").fetchall()
         return {"status": 200, "body": rows_to_list(rows)}
 
@@ -7569,6 +7785,8 @@ def dispatch(method, path, params, body, conn):
     if method == "GET" and path == "/driver/logbook":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         shift_id = params.get("shift_id")
         if not shift_id:
             return {"status": 400, "body": {"error": "shift_id required"}}
@@ -7595,6 +7813,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 201, "body": {"id": cur.lastrowid, "photo_type": photo_type}}
 
     if method == "GET" and path == "/driver/photos":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         dl_id = params.get("delivery_log_id")
         shift_id = params.get("shift_id")
         if dl_id:
@@ -7607,6 +7827,8 @@ def dispatch(method, path, params, body, conn):
 
     # Get single photo data (base64)
     if method == "GET" and path == "/driver/photo":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         photo_id = params.get("id")
         if not photo_id:
             return {"status": 400, "body": {"error": "id required"}}
@@ -7617,6 +7839,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- FATIGUE CONFIG -----
     if method == "GET" and path == "/driver/fatigue-config":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         row = conn.execute("SELECT * FROM driver_fatigue_config WHERE is_active=1 LIMIT 1").fetchone()
         return {"status": 200, "body": row_to_dict(row) if row else {"max_driving_hours_before_break": 5.0, "mandatory_break_minutes": 30, "max_shift_hours": 12.0, "warning_threshold_hours": 11.0}}
 
@@ -7645,6 +7869,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- FATIGUE CHECK (called by frontend periodically) -----
     if method == "GET" and path == "/driver/fatigue-check":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         shift_id = params.get("shift_id")
@@ -7714,6 +7940,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRACKMYRIDE CONFIG -----
     if method == "GET" and path == "/admin/trackmyride-config":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user or current_user["role"] not in ("executive", "office"):
             return {"status": 403, "body": {"error": "Admin access required"}}
         row = conn.execute("SELECT * FROM trackmyride_config LIMIT 1").fetchone()
@@ -7746,6 +7974,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRACKMYRIDE PROXY — Get live position for a truck -----
     if method == "GET" and path == "/trackmyride/position":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         truck_id = params.get("truck_id")
         if not truck_id:
             return {"status": 400, "body": {"error": "truck_id required"}}
@@ -7781,6 +8011,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRACKMYRIDE GEOFENCES CRUD -----
     if method == "GET" and path == "/trackmyride/geofences":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         rows = conn.execute("SELECT g.*, c.company_name as client_name FROM trackmyride_geofences g LEFT JOIN clients c ON c.id=g.linked_client_id WHERE g.is_active=1 ORDER BY g.name").fetchall()
         return {"status": 200, "body": rows_to_list(rows)}
 
@@ -7800,6 +8032,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRACKMYRIDE PLAYBACK (route history for a truck/date) -----
     if method == "GET" and path == "/trackmyride/playback":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         truck_id = params.get("truck_id")
         date = params.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         if not truck_id:
@@ -7812,6 +8046,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- TRACKMYRIDE REFUEL EVENTS -----
     if method == "GET" and path == "/trackmyride/refuel-events":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         truck_id = params.get("truck_id")
         if not truck_id:
             return {"status": 400, "body": {"error": "truck_id required"}}
@@ -7840,6 +8076,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DELIVERY COST BREAKDOWN (enhanced) -----
     if method == "GET" and path == "/driver/cost-breakdown":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         dl_id = params.get("delivery_log_id")
         shift_id = params.get("shift_id")
         if dl_id:
@@ -7943,6 +8181,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- EMAIL CONFIG -----
     if method == "GET" and path == "/admin/email-config":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user or current_user["role"] not in ("executive", "office"):
             return {"status": 403, "body": {"error": "Admin access required"}}
         row = conn.execute("SELECT * FROM email_config LIMIT 1").fetchone()
@@ -7963,7 +8203,8 @@ def dispatch(method, path, params, body, conn):
             for f in fields:
                 if f in body:
                     updates.append(f"{f}=?")
-                    vals.append(body[f])
+                    val = _smtp_encrypt(body[f]) if f == "smtp_password" else body[f]
+                    vals.append(val)
             if updates:
                 vals.append(datetime.now(timezone.utc).isoformat())
                 vals.append(row[0])
@@ -7971,7 +8212,7 @@ def dispatch(method, path, params, body, conn):
                 conn.commit()
         else:
             conn.execute("INSERT INTO email_config (smtp_host, smtp_port, smtp_user, smtp_password, smtp_use_tls, from_name, from_email, is_active) VALUES (?,?,?,?,?,?,?,?)",
-                [body.get("smtp_host",""), body.get("smtp_port",587), body.get("smtp_user",""), body.get("smtp_password",""),
+                [body.get("smtp_host",""), body.get("smtp_port",587), body.get("smtp_user",""), _smtp_encrypt(body.get("smtp_password","")),
                  body.get("smtp_use_tls",1), body.get("from_name","Hyne Pallets"), body.get("from_email",""), body.get("is_active",0)])
             conn.commit()
         row = conn.execute("SELECT * FROM email_config LIMIT 1").fetchone()
@@ -8053,6 +8294,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- PRODUCTION ANALYTICS -----
     if method == "GET" and path == "/stats/production-analytics":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         period = params.get("period", "7d")  # 7d, 30d, 90d, all
         days_back = {"7d": 7, "30d": 30, "90d": 90, "all": 3650}.get(period, 7)
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -8123,6 +8366,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- DELIVERY ANALYTICS -----
     if method == "GET" and path == "/stats/delivery-analytics":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         period = params.get("period", "30d")
         days_back = {"7d": 7, "30d": 30, "90d": 90, "all": 3650}.get(period, 30)
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -8192,6 +8437,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- BENCHMARKING ANALYTICS -----
     if method == "GET" and path == "/stats/benchmarking":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         period = params.get("period", "30d")
         days_back = {"7d": 7, "30d": 30, "90d": 90, "all": 3650}.get(period, 30)
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -8285,6 +8532,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- ADMIN CASCADE VALIDATION -----
     if method == "GET" and path == "/admin/cascade-check":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         # Check for orphaned references
         orphaned_stations = rows_to_list(conn.execute("""
             SELECT s.id, s.name, s.zone_id FROM stations s
@@ -8351,6 +8600,8 @@ def dispatch(method, path, params, body, conn):
     # ----- SUPPLIERS -----
 
     if method == "GET" and path == "/timber/suppliers":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -8497,6 +8748,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 201, "body": {"id": cur.lastrowid, "message": "Approval request submitted"}}
 
     if method == "GET" and path == "/timber/supplier-approvals":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
@@ -8551,6 +8804,8 @@ def dispatch(method, path, params, body, conn):
     # ----- SPECS -----
 
     if method == "GET" and path == "/timber/specs":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -8679,6 +8934,8 @@ def dispatch(method, path, params, body, conn):
     # ----- CONFIG -----
 
     if method == "GET" and path == "/timber/config":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -8730,6 +8987,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 201, "body": row}
 
     if method == "GET" and path == "/timber/deliveries":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -8749,6 +9008,8 @@ def dispatch(method, path, params, body, conn):
 
     m = match("/timber/deliveries/:id", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -8808,6 +9069,8 @@ def dispatch(method, path, params, body, conn):
 
     m = match("/timber/deliveries/:id/items", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -8937,6 +9200,8 @@ def dispatch(method, path, params, body, conn):
 
 
     if method == "GET" and path == "/timber/packs":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -8969,6 +9234,8 @@ def dispatch(method, path, params, body, conn):
     # ----- INVENTORY -----
 
     if method == "GET" and path == "/timber/inventory":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -9009,6 +9276,8 @@ def dispatch(method, path, params, body, conn):
 
 
     if method == "GET" and path == "/timber/summary":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -9034,6 +9303,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": summary}
 
     if method == "GET" and path == "/timber/inventory/summary":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -9060,6 +9331,8 @@ def dispatch(method, path, params, body, conn):
 
     m = match("/timber/packs/:qr", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -9333,6 +9606,8 @@ def dispatch(method, path, params, body, conn):
         }}
 
     if method == "GET" and path == "/timber/cost-imports":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
@@ -9342,6 +9617,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": rows}
 
     if method == "GET" and path == "/timber/valuation":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
@@ -9383,6 +9660,8 @@ def dispatch(method, path, params, body, conn):
 
     m = match("/timber/stocktakes/:id", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -9406,6 +9685,8 @@ def dispatch(method, path, params, body, conn):
 
     m = match("/timber/stocktakes/:id/sheet", path)
     if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -9474,6 +9755,8 @@ def dispatch(method, path, params, body, conn):
     # ----- REPORTS -----
 
     if method == "GET" and path == "/timber/reports/valuation":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
@@ -9494,6 +9777,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"rows": rows, "total_value": total}}
 
     if method == "GET" and path == "/timber/reports/purchases":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
@@ -9517,6 +9802,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"rows": rows}}
 
     if method == "GET" and path == "/timber/reports/consumption":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not _is_planner(current_user):
             return {"status": 403, "body": {"error": "Planner role required"}}
@@ -9548,6 +9835,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"rows": rows}}
 
     if method == "GET" and path == "/timber/reports/supplier-analysis":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
@@ -9566,6 +9855,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"rows": rows}}
 
     if method == "GET" and path == "/timber/reports/fifo-compliance":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not _is_planner(current_user):
             return {"status": 403, "body": {"error": "Planner role required"}}
@@ -9607,6 +9898,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": rows}
 
     if method == "GET" and path == "/timber/reports/export/myob":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not _is_exec(current_user):
             return {"status": 403, "body": {"error": "Executive role required"}}
@@ -9681,6 +9974,8 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"message": "Alert deleted"}}
 
     if method == "GET" and path == "/timber/alert-recipients":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         current_user = get_current_user(conn)
         if not current_user:
             return {"status": 401, "body": {"error": "Unauthorized"}}
@@ -9749,6 +10044,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- KANBAN SUMMARY -----
     if method == "GET" and path == "/ops/kanban-summary":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         # Count order items by kanban stage
@@ -9824,6 +10121,8 @@ def dispatch(method, path, params, body, conn):
 
     # ----- OPS MANAGER DASHBOARD -----
     if method == "GET" and path == "/ops/dashboard":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
         # Note: datetime, timezone, timedelta already imported at module level (line 17)
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         # Fetch labour rate from config (default $55/hr)

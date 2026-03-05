@@ -1,0 +1,9 @@
+{
+  "name": "Hyne Pallets - Receiving",
+  "short_name": "Receiving",
+  "start_url": "/receiving.html",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#07324C",
+  "icons": []
+}
