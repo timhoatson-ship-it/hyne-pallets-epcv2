@@ -1531,7 +1531,7 @@ const OfficeDashboard = ({ token }) => {
                           )}
                           <span style={{fontSize:13,fontWeight:700,color:'#166534',background:'#dcfce7',borderRadius:4,padding:'2px 8px'}}>ETA: {new Date(o.eta_date+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'})}</span>
                         </div>
-                        <span style={{fontSize:13,color:'#166534',fontWeight:600}}>\u2713 Done</span>
+                        <span style={{fontSize:13,color:'#166534',fontWeight:600}}>✓ Done</span>
                       </div>
                     ))}
                   </div>
@@ -1595,7 +1595,7 @@ const OfficeDashboard = ({ token }) => {
                             }}
                             title="Click to toggle delivery type"
                           >
-                            {o.delivery_type === 'collection' ? '\ud83d\udce6 Collection' : '\ud83d\ude9a Delivery'}
+                            {o.delivery_type === 'collection' ? '📦 Collection' : '🚚 Delivery'}
                           </button>
                         </td>
                         <td>
@@ -2753,7 +2753,7 @@ const PlanningBoard = ({ token, user }) => {
         // Format next_date nicely
         const nd = new Date(res.next_date + 'T00:00:00');
         const ndStr = nd.toLocaleDateString('en-AU', { weekday: 'short', day: 'numeric', month: 'short' });
-        toast(`Day closed \u2014 ${res.pushed_count} work order${res.pushed_count !== 1 ? 's' : ''} pushed to ${ndStr}`, 'info');
+        toast(`Day closed — ${res.pushed_count} work order${res.pushed_count !== 1 ? 's' : ''} pushed to ${ndStr}`, 'info');
       } else if (!isClosed) {
         toast('Day closed', 'success');
       }
@@ -3049,7 +3049,7 @@ const PlanningBoard = ({ token, user }) => {
                                         onClick={() => toggleExpandClosedDay(day.date)}
                                         style={{marginTop:3,fontSize:13,color:'#6366f1',background:'#eef2ff',border:'none',borderRadius:3,padding:'1px 5px',cursor:'pointer',fontWeight:600}}
                                       >
-                                        {isExpanded ? '\u25b2 Hide' : '\u25bc Expand'}
+                                        {isExpanded ? '▲ Hide' : '▼ Expand'}
                                       </button>
                                       {isExpanded && (slot.entries || []).map((e,i) => (
                                         <div key={i} style={{marginTop:3,padding:'2px 4px',background:'white',borderRadius:3,border:'1px solid #e2e8f0',textAlign:'left'}}>
@@ -4367,7 +4367,7 @@ const QADashboard = ({ token }) => {
   const approveAndRelease = async () => {
     try {
       await api(`/qa/inspections/${inspecting.id}/approve`, {method:'PUT'}, token);
-      toast('QA Approved \u2014 item released to Finished','success');
+      toast('QA Approved — item released to Finished','success');
       setInspecting(null);
       load();
     } catch (e) { toast(e.message,'error'); }
@@ -4416,11 +4416,11 @@ const QADashboard = ({ token }) => {
                     <tbody>
                       {pendingInspections.map(insp => (
                         <tr key={insp.id}>
-                          <td className="font-bold text-[#07324C]">{insp.order_number || '\u2014'}</td>
-                          <td style={{fontFamily:'monospace',fontWeight:900,color:'#07324C',fontSize:15}}>{insp.sku_code || '\u2014'}</td>
-                          <td>{insp.product_name || '\u2014'}</td>
-                          <td>{insp.client_name || '\u2014'}</td>
-                          <td>{insp.batch_size || '\u2014'}</td>
+                          <td className="font-bold text-[#07324C]">{insp.order_number || '—'}</td>
+                          <td style={{fontFamily:'monospace',fontWeight:900,color:'#07324C',fontSize:15}}>{insp.sku_code || '—'}</td>
+                          <td>{insp.product_name || '—'}</td>
+                          <td>{insp.client_name || '—'}</td>
+                          <td>{insp.batch_size || '—'}</td>
                           <td>{insp.produced_quantity || 0} / {insp.item_quantity || 0}</td>
                           <td><button className="btn btn-primary btn-sm" onClick={()=>{setInspecting(insp);setDefects([]);setNotes('');}}>Inspect</button></td>
                         </tr>
@@ -4436,7 +4436,7 @@ const QADashboard = ({ token }) => {
             <div className="hp-card">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="font-bold text-[#07324C] text-lg">Inspecting: {inspecting.order_number}</h2>
-                <button className="btn btn-secondary btn-sm" onClick={()=>setInspecting(null)}>{"\u2190"} Back</button>
+                <button className="btn btn-secondary btn-sm" onClick={()=>setInspecting(null)}>← Back</button>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                 <div>
@@ -4444,8 +4444,8 @@ const QADashboard = ({ token }) => {
                   <div className="space-y-2 text-sm">
                     <div><span className="text-gray-400">Client:</span> <span className="font-medium">{inspecting.client_name}</span></div>
                     <div><span className="text-gray-400">Product:</span> <span className="font-medium">
-                      <span style={{fontFamily:'monospace',fontWeight:900,color:'#07324C',fontSize:16}}>{inspecting.sku_code || '\u2014'}</span>
-                      {inspecting.product_name && <span style={{color:'#6b7280',fontWeight:400}}> \u2014 {inspecting.product_name}</span>}
+                      <span style={{fontFamily:'monospace',fontWeight:900,color:'#07324C',fontSize:16}}>{inspecting.sku_code || '—'}</span>
+                      {inspecting.product_name && <span style={{color:'#6b7280',fontWeight:400}}> — {inspecting.product_name}</span>}
                     </span></div>
                     <div><span className="text-gray-400">Batch Size:</span> <span className="font-medium">{inspecting.batch_size || inspecting.item_quantity} units</span></div>
                     <div><span className="text-gray-400">Produced:</span> <span className="font-medium">{inspecting.produced_quantity || 0} units</span></div>
@@ -4460,7 +4460,7 @@ const QADashboard = ({ token }) => {
                       <option value="destroy">Destroy</option>
                     </select>
                     <input type="number" className="hp-input" min="1" value={defectForm.qty} onChange={e=>setDefectForm(p=>({...p,qty:parseInt(e.target.value)||1}))} placeholder="Quantity" />
-                    <input className="hp-input" value={defectForm.desc} onChange={e=>setDefectForm(p=>({...p,desc:e.target.value}))} placeholder="Description\u2026" />
+                    <input className="hp-input" value={defectForm.desc} onChange={e=>setDefectForm(p=>({...p,desc:e.target.value}))} placeholder="Description…" />
                     <button className="btn btn-warning btn-sm" onClick={addDefect}>+ Log Defect</button>
                   </div>
                 </div>
@@ -4472,17 +4472,17 @@ const QADashboard = ({ token }) => {
                       {defects.map((d,i) => (
                         <div key={i} className="flex items-center gap-3 p-2 bg-red-50 border border-red-100 rounded text-sm">
                           <span className="font-bold text-red-700 capitalize">{d.defect_type}</span>
-                          <span className="text-red-600">\u00d7{d.quantity}</span>
+                          <span className="text-red-600">×{d.quantity}</span>
                           <span className="text-gray-500 text-xs">{d.description}</span>
                         </div>
                       ))}
                     </div>
                   )}
 
-                  <textarea className="hp-input mb-4" rows={3} value={notes} onChange={e=>setNotes(e.target.value)} placeholder="QA notes\u2026" />
+                  <textarea className="hp-input mb-4" rows={3} value={notes} onChange={e=>setNotes(e.target.value)} placeholder="QA notes…" />
 
                   <button className="btn btn-success btn-lg w-full justify-center" onClick={approveAndRelease}>
-                    <Icon name="CheckCircle" size={18}/> Approve \u0026 Release to Finished
+                    <Icon name="CheckCircle" size={18}/> Approve & Release to Finished
                   </button>
                 </div>
               </div>
@@ -4499,13 +4499,13 @@ const QADashboard = ({ token }) => {
                     <tbody>
                       {allInspections.map(i => (
                         <tr key={i.id}>
-                          <td className="font-bold text-[#07324C]">{i.order_number||'\u2014'}</td>
-                          <td className="font-mono font-bold" style={{color:'#07324C'}}>{i.sku_code||'\u2014'}</td>
-                          <td>{i.inspector_name||'\u2014'}</td>
+                          <td className="font-bold text-[#07324C]">{i.order_number||'—'}</td>
+                          <td className="font-mono font-bold" style={{color:'#07324C'}}>{i.sku_code||'—'}</td>
+                          <td>{i.inspector_name||'—'}</td>
                           <td className="capitalize">{i.inspection_type}</td>
-                          <td>{i.batch_size||'\u2014'}</td>
+                          <td>{i.batch_size||'—'}</td>
                           <td>{i.passed ? <span className="text-green-600 font-bold">Pass</span> : <span className="text-red-600 font-bold">Pending</span>}</td>
-                          <td className="text-xs text-gray-500">{i.inspected_at?.split('T')[0] || '\u2014'}</td>
+                          <td className="text-xs text-gray-500">{i.inspected_at?.split('T')[0] || '—'}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -4575,14 +4575,14 @@ const QADashboard = ({ token }) => {
                     <tbody>
                       {audits.map(a => (
                         <tr key={a.id}>
-                          <td className="text-xs text-gray-500">{a.created_at?.split('T')[0]||'\u2014'}</td>
-                          <td className="font-medium">{a.auditor_name||'\u2014'}</td>
-                          <td>{a.zone_name||'\u2014'}</td>
-                          <td>{a.station_name||'\u2014'}</td>
-                          <td className="font-mono font-bold" style={{color:'#07324C'}}>{a.sku_code||'\u2014'}</td>
+                          <td className="text-xs text-gray-500">{a.created_at?.split('T')[0]||'—'}</td>
+                          <td className="font-medium">{a.auditor_name||'—'}</td>
+                          <td>{a.zone_name||'—'}</td>
+                          <td>{a.station_name||'—'}</td>
+                          <td className="font-mono font-bold" style={{color:'#07324C'}}>{a.sku_code||'—'}</td>
                           <td>{a.batch_size||1}</td>
                           <td>{a.passed ? <span className="text-green-600 font-bold">Pass</span> : <span className="text-red-600 font-bold">Fail</span>}</td>
-                          <td className="text-xs text-gray-500 max-w-xs truncate">{a.notes||'\u2014'}</td>
+                          <td className="text-xs text-gray-500 max-w-xs truncate">{a.notes||'—'}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -4707,7 +4707,7 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
                 border:'none',borderRadius:4,padding:'2px 5px',fontSize:12,fontWeight:700,cursor:'pointer',marginTop:2}}
               title="Toggle delivery/collection"
             >
-              {entry.delivery_type === 'collection' ? '\ud83d\udce6' : '\ud83d\ude9a'}
+              {entry.delivery_type === 'collection' ? '📦' : '🚚'}
             </button>
           )}
         </div>
@@ -4721,7 +4721,7 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
         <div style={{marginTop:3}}>
           {entry.items.slice(0,3).map((it,i) => (
             <div key={i} style={{fontSize:13,fontFamily:'monospace',fontWeight:700,color:'#07324C',lineHeight:1.3}}>
-              {it.sku_code || it.product_name} <span style={{fontWeight:400,color:'#6b7280',fontFamily:'inherit',fontSize:13}}>\u00d7{it.quantity}</span>
+              {it.sku_code || it.product_name} <span style={{fontWeight:400,color:'#6b7280',fontFamily:'inherit',fontSize:13}}>×{it.quantity}</span>
             </div>
           ))}
           {entry.items.length > 3 && <span style={{fontSize:13,color:'#9ca3af'}}>+{entry.items.length-3} more</span>}
@@ -5779,9 +5779,9 @@ const DispatchDashboard = ({ token }) => {
       </div>
       {/* Toolbar — Row 2: Context controls */}
       <div style={{background:'#0a4163',padding:'8px 16px',display:'flex',alignItems:'center',gap:10,flexShrink:0,flexWrap:'wrap'}}>
-        <button onClick={() => setDayOffset(d=>d-numDays)} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'5px 12px',cursor:'pointer',fontSize:15,fontWeight:700}}>{"\u2039"} Prev</button>
+        <button onClick={() => setDayOffset(d=>d-numDays)} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'5px 12px',cursor:'pointer',fontSize:15,fontWeight:700}}>‹ Prev</button>
         <span style={{color:'white',fontSize:16,fontWeight:600,minWidth:180,textAlign:'center'}}>{weekLabel}</span>
-        <button onClick={() => setDayOffset(d=>d+numDays)} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'5px 12px',cursor:'pointer',fontSize:15,fontWeight:700}}>Next {"\u203A"}</button>
+        <button onClick={() => setDayOffset(d=>d+numDays)} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'5px 12px',cursor:'pointer',fontSize:15,fontWeight:700}}>Next ›</button>
         <button onClick={snapToToday} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'5px 12px',cursor:'pointer',fontSize:15}}>Today</button>
         <div style={{display:'flex',alignItems:'center',gap:6}}>
           <span style={{color:'rgba(255,255,255,0.8)',fontSize:14}}>Days:</span>
@@ -5795,7 +5795,7 @@ const DispatchDashboard = ({ token }) => {
           const name = prompt('Contractor truck name (e.g. Contractor 3):');
           if (name && name.trim()) setExtraContractors(p => [...p, { id:'c_'+Date.now(), name:name.trim(), driver_name:'', rego:'', is_contractor:true }]);
         }} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:6,padding:'5px 12px',cursor:'pointer',fontSize:14,fontWeight:700}}>+ Contractor</button>
-        <button onClick={reload} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'5px 10px',cursor:'pointer',fontSize:15}}>\u21ba Refresh</button>
+        <button onClick={reload} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',borderRadius:5,padding:'5px 10px',cursor:'pointer',fontSize:15}}>↺ Refresh</button>
       </div>
 
       {loading ? (
@@ -5816,7 +5816,7 @@ const DispatchDashboard = ({ token }) => {
                 flexShrink:0,display:'flex',justifyContent:'space-between',alignItems:'center',cursor:'pointer'}}
                 onClick={() => setIntakeOpen(p=>!p)}>
                 {intakeOpen ? <span>Intake Queue</span> : <span style={{writingMode:'vertical-rl',transform:'rotate(180deg)',fontSize:13}}>Intake</span>}
-                <span style={{fontSize:16,opacity:0.8}}>{intakeOpen ? '\u25c4' : '\u25ba'}</span>
+                <span style={{fontSize:16,opacity:0.8}}>{intakeOpen ? '◄' : '►'}</span>
               </div>
               {intakeOpen && (
                 <>
@@ -5827,7 +5827,7 @@ const DispatchDashboard = ({ token }) => {
                   <div style={{flex:1,overflowY:'auto',padding:'6px 8px'}}>
                     {unassigned.length === 0 ? (
                       <div style={{textAlign:'center',color:'#9ca3af',fontSize:15,padding:'24px 8px'}}>
-                        <div style={{fontSize:24,marginBottom:8}}>\u2713</div>
+                        <div style={{fontSize:24,marginBottom:8}}>✓</div>
                         All deliveries assigned
                       </div>
                     ) : unassigned.map(entry => (
@@ -5912,7 +5912,7 @@ const DispatchDashboard = ({ token }) => {
                                 style={{width:'100%',fontSize:13,padding:'3px 6px',borderRadius:4,border:'1px solid #d1d5db',
                                   background:'white',color:'#07324C',fontWeight:600,marginBottom:3}}
                               >
-                                <option value="">Driver\u2026</option>
+                                <option value="">Driver…</option>
                                 {/* Show truck default driver */}
                                 {truck.driver_name && <option value="">{truck.driver_name} (default)</option>}
                                 {v2Drivers.map(d => <option key={d.id} value={d.id}>{d.full_name}</option>)}
@@ -5961,7 +5961,7 @@ const DispatchDashboard = ({ token }) => {
                                     <div style={{display:'flex',alignItems:'center',gap:4}}>
                                       {run.status === 'in_transit' ? (
                                         <span style={{fontSize:12,fontWeight:800,color:'#2563eb',display:'flex',alignItems:'center',gap:2}}>
-                                          <span style={{color:'#16a34a'}}>\u2713</span> Dispatched
+                                          <span style={{color:'#16a34a'}}>✓</span> Dispatched
                                         </span>
                                       ) : run.status === 'completed' ? (
                                         <span style={{fontSize:12,fontWeight:800,color:'#dc2626'}}>Delivered</span>
@@ -5969,13 +5969,13 @@ const DispatchDashboard = ({ token }) => {
                                         <button
                                           onClick={() => { if(window.confirm(`Confirm dispatch Run ${run.run_number}?`)) api(`/dispatch-runs/${run.id}/dispatch`,{method:'PUT'},token).then(()=>{toast('Dispatched!','success');reload();}).catch(e=>toast(e.message,'error')); }}
                                           style={{fontSize:12,padding:'2px 7px',borderRadius:4,background:'#07324C',color:'white',border:'none',cursor:'pointer',fontWeight:700}}
-                                        >\ud83d\ude9a Dispatch</button>
+                                        >🚚 Dispatch</button>
                                       ) : null}
                                       <button
                                         onClick={() => { if(window.confirm(`Delete Run ${run.run_number}?`)) api(`/dispatch-runs/${run.id}`,{method:'DELETE'},token).then(()=>{toast('Run deleted','success');reload();}).catch(e=>toast(e.message,'error')); }}
                                         style={{fontSize:12,padding:'1px 5px',borderRadius:3,background:'#fee2e2',color:'#dc2626',border:'none',cursor:'pointer',fontWeight:700}}
                                         title="Delete run"
-                                      >\u00d7</button>
+                                      >×</button>
                                     </div>
                                   </div>
                                   {/* Entries */}
@@ -6011,7 +6011,7 @@ const DispatchDashboard = ({ token }) => {
                                           <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:2,flexShrink:0}}>
                                             <span style={{fontSize:12,color:'#6366f1',fontWeight:600,background:'#eef2ff',borderRadius:3,padding:'1px 4px'}}>{fmtMinutes(entry.estimated_minutes)||'~?'}</span>
                                             {entry.status === 'delivered' && <span style={{fontSize:11,fontWeight:800,color:'#dc2626'}}>DELIVERED</span>}
-                                            {entry.status === 'in_transit' && <span style={{fontSize:11,fontWeight:700,color:'#2563eb'}}>\u2713 Out</span>}
+                                            {entry.status === 'in_transit' && <span style={{fontSize:11,fontWeight:700,color:'#2563eb'}}>✓ Out</span>}
                                           </div>
                                         </div>
                                       </div>
@@ -6080,7 +6080,7 @@ const DispatchDashboard = ({ token }) => {
                 flexShrink:0,display:'flex',justifyContent:'space-between',alignItems:'center',cursor:'pointer',whiteSpace:'nowrap'}}
                 onClick={() => setCollectionsOpen(p=>!p)}>
                 {collectionsOpen ? (
-                  <><span>Collections</span><span style={{opacity:0.8}}>\u25ba</span></>
+                  <><span>Collections</span><span style={{opacity:0.8}}>►</span></>
                 ) : (
                   <span style={{writingMode:'vertical-rl',transform:'rotate(180deg)',fontSize:13}}>Cols</span>
                 )}
@@ -6298,14 +6298,14 @@ const PostProductionDashboard = ({ token }) => {
             <tbody>
               {logs.map(l=>(
                 <tr key={l.id}>
-                  <td className="font-bold">{l.process_name||'\u2014'}</td>
-                  <td className="font-bold text-[#07324C]">{l.order_number||'\u2014'}</td>
-                  <td className="font-mono font-bold" style={{color:'#07324C'}}>{l.sku_code||'\u2014'}</td>
-                  <td>{l.client_name||'\u2014'}</td>
-                  <td>{l.quantity||'\u2014'}</td>
-                  <td>{l.facility||'\u2014'}</td>
-                  <td>{l.operator_name||'\u2014'}</td>
-                  <td className="text-xs">{l.started_at?.split('T')[0]||'\u2014'}</td>
+                  <td className="font-bold">{l.process_name||'—'}</td>
+                  <td className="font-bold text-[#07324C]">{l.order_number||'—'}</td>
+                  <td className="font-mono font-bold" style={{color:'#07324C'}}>{l.sku_code||'—'}</td>
+                  <td>{l.client_name||'—'}</td>
+                  <td>{l.quantity||'—'}</td>
+                  <td>{l.facility||'—'}</td>
+                  <td>{l.operator_name||'—'}</td>
+                  <td className="text-xs">{l.started_at?.split('T')[0]||'—'}</td>
                   <td>{l.status==='completed'?<span className="text-green-600 font-bold">Done</span>:<span className="text-amber-600 font-bold">Active</span>}</td>
                   <td>{l.status!=='completed'&&<button className="btn btn-success btn-sm" onClick={()=>completeProcess(l.id)}>Complete</button>}</td>
                 </tr>
@@ -6386,10 +6386,10 @@ const ProductionLogScreen = ({ token }) => {
                       <tbody>
                         {entries.map((e,i)=>(
                           <tr key={i}>
-                            <td>{e.station_name||'\u2014'}</td>
-                            <td className="font-bold text-[#07324C]">{e.order_number||'\u2014'}</td>
-                            <td className="font-mono font-bold" style={{color:'#07324C'}}>{e.sku_code||'\u2014'}</td>
-                            <td>{e.client_name||'\u2014'}</td>
+                            <td>{e.station_name||'—'}</td>
+                            <td className="font-bold text-[#07324C]">{e.order_number||'—'}</td>
+                            <td className="font-mono font-bold" style={{color:'#07324C'}}>{e.sku_code||'—'}</td>
+                            <td>{e.client_name||'—'}</td>
                             <td>{e.planned_quantity||0}</td>
                             <td className="font-bold">{e.produced_quantity||0}</td>
                             <td>{e.target_qty||0}</td>
@@ -9684,7 +9684,7 @@ const ChainsawDockingWorkView = ({ token, user }) => {
       } catch {
         await api(`/orders/${job.order_id}/docking-complete`, { method: 'PUT' }, token);
       }
-      toast('\u2713 Docking complete — ready for production', 'success');
+      toast('✓ Docking complete — ready for production', 'success');
       setJobs(prev => prev.filter(j => j.id !== job.id));
     } catch(e) { toast(e.message, 'error'); }
     setCompleting(p => ({...p, [job.id]: false}));
@@ -9703,7 +9703,7 @@ const ChainsawDockingWorkView = ({ token, user }) => {
             {loading ? '...' : jobs.length} job{jobs.length !== 1 ? 's' : ''} pending docking
           </div>
           <button onClick={loadJobs} style={{ background: 'rgba(255,255,255,0.15)', border: 'none', color: 'white', borderRadius: 6, padding: '8px 16px', cursor: 'pointer', fontSize: 15, fontWeight: 700 }}>
-            \u21ba Refresh
+            ↺ Refresh
           </button>
         </div>
       </div>
@@ -9712,7 +9712,7 @@ const ChainsawDockingWorkView = ({ token, user }) => {
         <div style={{ textAlign: 'center', padding: '40px 0' }}><Spinner /></div>
       ) : jobs.length === 0 ? (
         <div style={{ textAlign: 'center', padding: '60px 20px', background: 'white', borderRadius: 10, boxShadow: '0 1px 4px rgba(0,0,0,0.08)' }}>
-          <div style={{ fontSize: 48, marginBottom: 16 }}>\u2713</div>
+          <div style={{ fontSize: 48, marginBottom: 16 }}>✓</div>
           <div style={{ fontSize: 20, fontWeight: 700, color: '#16a34a', marginBottom: 8 }}>All caught up!</div>
           <div style={{ fontSize: 15, color: '#6b7280' }}>No items currently in docking queue</div>
         </div>
@@ -9729,8 +9729,8 @@ const ChainsawDockingWorkView = ({ token, user }) => {
                   <div style={{ fontWeight: 900, color: '#07324C', fontSize: 18, marginBottom: 4 }}>{job.order_number}</div>
                   <div style={{ color: '#6b7280', fontSize: 15, marginBottom: 4 }}>{job.client_name}</div>
                   <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-                    <span style={{ fontFamily: 'monospace', fontWeight: 800, color: '#07324C', fontSize: 16, background: '#f1f5f9', padding: '3px 10px', borderRadius: 5 }}>{job.sku_code || '\u2014'}</span>
-                    <span style={{ background: '#2563eb', color: 'white', fontWeight: 800, fontSize: 16, padding: '3px 12px', borderRadius: 5 }}>\u00d7{(job.quantity || 0).toLocaleString()}</span>
+                    <span style={{ fontFamily: 'monospace', fontWeight: 800, color: '#07324C', fontSize: 16, background: '#f1f5f9', padding: '3px 10px', borderRadius: 5 }}>{job.sku_code || '—'}</span>
+                    <span style={{ background: '#2563eb', color: 'white', fontWeight: 800, fontSize: 16, padding: '3px 12px', borderRadius: 5 }}>×{(job.quantity || 0).toLocaleString()}</span>
                     {job.zone && <span style={{ background: '#e0f2fe', color: '#0369a1', fontWeight: 700, fontSize: 14, padding: '3px 10px', borderRadius: 5 }}>{job.zone}</span>}
                   </div>
                 </div>
@@ -9746,7 +9746,7 @@ const ChainsawDockingWorkView = ({ token, user }) => {
                     minWidth: 180, textAlign: 'center'
                   }}
                 >
-                  {completing[job.id] ? '...' : '\u2713 Docking Complete'}
+                  {completing[job.id] ? '...' : '✓ Docking Complete'}
                 </button>
               </div>
             </div>
