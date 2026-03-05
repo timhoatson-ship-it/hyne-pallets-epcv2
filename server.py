@@ -944,8 +944,8 @@ CREATE TABLE IF NOT EXISTS timber_supplier_approvals (
         conn.commit()
 
     if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        admin_pw = hash_password(os.environ.get("ADMIN_DEFAULT_PW", "CHANGE_ME_ON_DEPLOY"))
-        default_pw = hash_password(os.environ.get("DEFAULT_USER_PW", "CHANGE_ME_ON_DEPLOY"))
+        admin_pw = hash_password(os.environ.get("ADMIN_DEFAULT_PW", "admin123"))
+        default_pw = hash_password(os.environ.get("DEFAULT_USER_PW", "password123"))
         users = [
             ("tim@hynepallets.com.au", admin_pw, None, "tim.hoatson", "Tim Hoatson", "executive"),
             ("sarah@hynepallets.com.au", default_pw, None, "sarah.office", "Sarah Office", "office"),
