@@ -467,7 +467,7 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
 
   useEffect(()=>{
     loadData();
-    pollRef.current = setInterval(loadData, 15000);
+    pollRef.current = setInterval(loadData, 5000);
     return ()=>clearInterval(pollRef.current);
   },[loadData]);
 
@@ -824,7 +824,7 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
       } catch(e){}
     };
     refresh();
-    pollRef.current = setInterval(refresh,15000);
+    pollRef.current = setInterval(refresh,5000);
     return ()=>clearInterval(pollRef.current);
   },[sessionId, token]);
 
@@ -1049,7 +1049,7 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
             style={{background:'#3B82F6',flexDirection:'column',gap:'4px',padding:'18px 8px',fontSize:'17px'}}>
             🔄 SWITCH SKU
           </button>
-          <button className="action-btn" onClick={()=>onComplete(sessionId)}
+          <button className="action-btn" onClick={()=>onComplete(sessionId, pallets)}
             style={{background:'#059669',flexDirection:'column',gap:'4px',padding:'18px 8px',fontSize:'17px'}}>
             ✓ COMPLETE
           </button>
@@ -1456,9 +1456,9 @@ const App = () => {
     setShowPauseModal(true);
   };
 
-  const handleComplete = async(sid) => {
+  const handleComplete = async(sid, producedQty) => {
     try {
-      await api(`/production/sessions/${sid}/complete`,{method:'PUT',body:JSON.stringify({})},token);
+      await api(`/production/sessions/${sid}/complete`,{method:'PUT',body:JSON.stringify({ produced_quantity: producedQty ?? undefined })},token);
       setCompletedSessionId(sid);
       setScreen('summary');
     } catch(e){

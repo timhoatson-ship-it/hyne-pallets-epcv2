@@ -2488,10 +2488,33 @@ def migrate_db():
 
     conn.commit()
 
+    # --- Delivery groups for order splitting ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS delivery_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL REFERENCES orders(id),
+            group_name TEXT NOT NULL,
+            requested_delivery_date TEXT,
+            status TEXT DEFAULT 'pending',
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS delivery_group_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            delivery_group_id INTEGER NOT NULL REFERENCES delivery_groups(id),
+            order_item_id INTEGER NOT NULL REFERENCES order_items(id),
+            quantity INTEGER NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+
     # ----- Performance Indexes (Bug #15 fix) -----
     try:
         index_stmts = [
-            "CREATE INDEX IF NOT EXISTS idx_order_items_order_id ON order_items(order_id)",
             "CREATE INDEX IF NOT EXISTS idx_order_items_status ON order_items(status)",
             "CREATE INDEX IF NOT EXISTS idx_order_items_zone_id ON order_items(zone_id)",
             "CREATE INDEX IF NOT EXISTS idx_order_items_sku_id ON order_items(sku_id)",
@@ -4241,6 +4264,14 @@ def dispatch(method, path, params, body, conn):
         for f in ["station_id", "zone_id"]:
             if not body.get(f):
                 return {"status": 400, "body": {"error": f"Field '{f}' is required"}}
+        # Prevent duplicate active sessions for same order_item
+        if body.get("order_item_id"):
+            existing_active = conn.execute(
+                "SELECT * FROM production_sessions WHERE order_item_id=? AND status='active'",
+                [body["order_item_id"]]
+            ).fetchone()
+            if existing_active:
+                return {"status": 200, "body": row_to_dict(existing_active)}
         try:
             cur = conn.execute("INSERT INTO production_sessions (order_item_id, station_id, zone_id, shift_id, target_quantity, is_sub_assembly, notes) VALUES (?,?,?,?,?,?,?)",
                 [body.get("order_item_id"), body["station_id"], body["zone_id"], body.get("shift_id"), body.get("target_quantity"), body.get("is_sub_assembly", 0), body.get("notes")])
@@ -4256,6 +4287,17 @@ def dispatch(method, path, params, body, conn):
                     conn.execute("UPDATE order_items SET status='P' WHERE id=?", [order_item_id])
                     conn.commit()
                     sync_order_status(conn, item_row["order_id"])
+            # Auto-start: update schedule_entries from 'planned' → 'in_progress' when floor worker starts
+            if order_item_id:
+                se_planned = conn.execute(
+                    "SELECT id FROM schedule_entries WHERE order_item_id=? AND status='planned' ORDER BY scheduled_date ASC LIMIT 1",
+                    [order_item_id]
+                ).fetchone()
+                if se_planned:
+                    conn.execute(
+                        "UPDATE schedule_entries SET status='in_progress', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        [se_planned["id"]]
+                    )
             row = conn.execute("SELECT * FROM production_sessions WHERE id=?", [session_id]).fetchone()
             return {"status": 201, "body": row_to_dict(row)}
         except Exception as e:
@@ -4354,6 +4396,23 @@ def dispatch(method, path, params, body, conn):
                 [session["order_item_id"]]
             ).fetchone()[0]
             conn.execute("UPDATE order_items SET produced_quantity=? WHERE id=?", [total_produced, session["order_item_id"]])
+            conn.commit()
+            # --- Auto-update schedule_entries status when floor worker completes ---
+            se_row = conn.execute(
+                "SELECT id FROM schedule_entries WHERE order_item_id=? AND status='in_progress' ORDER BY id DESC LIMIT 1",
+                [session["order_item_id"]]
+            ).fetchone()
+            if se_row:
+                conn.execute(
+                    "UPDATE schedule_entries SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    [se_row["id"]]
+                )
+            
+            # --- Refresh kanban status cache for this order ---
+            item_row_kanban = conn.execute("SELECT order_id FROM order_items WHERE id=?", [session["order_item_id"]]).fetchone()
+            if item_row_kanban:
+                update_kanban_statuses(conn, item_row_kanban["order_id"])
+            
             conn.commit()
             # QA is the gate that releases to dispatch
             # Create QA inspection when target is met OR when force-completed by authorized user
@@ -4561,6 +4620,8 @@ def dispatch(method, path, params, body, conn):
                 conn.execute("UPDATE order_items SET status='F' WHERE id=?", [insp["order_item_id"]])
                 conn.commit()
                 sync_order_status(conn, item["order_id"])
+                update_kanban_statuses(conn, item["order_id"])
+                conn.commit()
         row = conn.execute("SELECT * FROM qa_inspections WHERE id=?", [iid]).fetchone()
         return {"status": 200, "body": row_to_dict(row)}
 
@@ -5945,6 +6006,18 @@ def dispatch(method, path, params, body, conn):
             return {"status": 401, "body": {"error": "Authentication required"}}
         run_id = int(m["id"])
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # Gate check: all order items must be 'F' (QA complete) before dispatch
+        gate_dl_rows = conn.execute("SELECT dl.order_id, o.order_number FROM delivery_log dl LEFT JOIN orders o ON o.id=dl.order_id WHERE dl.run_id=? AND dl.order_id IS NOT NULL", [run_id]).fetchall()
+        for gate_dlr in gate_dl_rows:
+            gate_oid = gate_dlr[0] if not isinstance(gate_dlr, dict) else gate_dlr["order_id"]
+            gate_order_number = gate_dlr[1] if not isinstance(gate_dlr, dict) else gate_dlr.get("order_number", gate_oid)
+            if gate_oid:
+                incomplete = conn.execute(
+                    "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('F', 'dispatched')",
+                    [gate_oid]
+                ).fetchone()[0]
+                if incomplete > 0:
+                    return {"status": 400, "body": {"error": f"Order {gate_order_number} has {incomplete} items not yet QA-approved. Cannot dispatch."}}
         conn.execute("UPDATE dispatch_runs SET status='in_transit', departure_time=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [now, run_id])
         # Update all linked delivery_log entries
         conn.execute("UPDATE delivery_log SET status='in_transit', updated_at=CURRENT_TIMESTAMP WHERE run_id=?", [run_id])
@@ -6362,6 +6435,31 @@ def dispatch(method, path, params, body, conn):
         conn.execute("UPDATE skus SET is_active=0 WHERE id=?", [sku_id])
         conn.commit()
         return {"status": 200, "body": {"message": "SKU deactivated"}}
+
+    m2 = match("/skus/:id/stock", path)
+    if m2 and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        sku_id = int(m2["id"])
+        # Count finished items (status='F') not yet dispatched
+        finished = conn.execute(
+            "SELECT COALESCE(SUM(quantity),0) as total_qty, COUNT(*) as item_count "
+            "FROM order_items WHERE sku_id=? AND status='F'",
+            [sku_id]
+        ).fetchone()
+        # Count in production
+        in_prod = conn.execute(
+            "SELECT COALESCE(SUM(produced_quantity),0) as produced, COALESCE(SUM(quantity),0) as target "
+            "FROM order_items WHERE sku_id=? AND status='P'",
+            [sku_id]
+        ).fetchone()
+        return {"status": 200, "body": {
+            "sku_id": sku_id,
+            "finished_stock": finished[0],
+            "finished_items": finished[1],
+            "in_production_produced": in_prod[0],
+            "in_production_target": in_prod[1]
+        }}
 
     # ----- STATS -----
     if method == "GET" and path == "/stats/production":
@@ -10595,6 +10693,94 @@ def dispatch(method, path, params, body, conn):
             "order_id": order_id
         }}
 
+
+    # ----- DELIVERY GROUPS (order splitting) -----
+    m = match("/orders/:id/delivery-groups", path)
+    if m and method == "POST":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        oid = int(m["id"])
+        if not body.get("group_name"):
+            return {"status": 400, "body": {"error": "group_name is required"}}
+        order_row = conn.execute("SELECT id FROM orders WHERE id=?", [oid]).fetchone()
+        if not order_row:
+            return {"status": 404, "body": {"error": "Order not found"}}
+        cur = conn.execute(
+            "INSERT INTO delivery_groups (order_id, group_name, requested_delivery_date, status, notes) VALUES (?,?,?,?,?)",
+            [oid, body["group_name"], body.get("requested_delivery_date"), body.get("status", "pending"), body.get("notes")]
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM delivery_groups WHERE id=?", [cur.lastrowid]).fetchone()
+        return {"status": 201, "body": row_to_dict(row)}
+
+    if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        oid = int(m["id"])
+        groups = rows_to_list(conn.execute("SELECT * FROM delivery_groups WHERE order_id=? ORDER BY id", [oid]).fetchall())
+        for g in groups:
+            g["items"] = rows_to_list(conn.execute(
+                "SELECT dgi.*, oi.sku_code, oi.product_name FROM delivery_group_items dgi LEFT JOIN order_items oi ON oi.id=dgi.order_item_id WHERE dgi.delivery_group_id=?",
+                [g["id"]]
+            ).fetchall())
+        return {"status": 200, "body": groups}
+
+    m = match("/delivery-groups/:id", path)
+    if m and method == "PUT":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        dgid = int(m["id"])
+        row = conn.execute("SELECT id FROM delivery_groups WHERE id=?", [dgid]).fetchone()
+        if not row:
+            return {"status": 404, "body": {"error": "Delivery group not found"}}
+        fields, vals = [], []
+        for f in ["group_name", "requested_delivery_date", "status", "notes"]:
+            if f in body:
+                fields.append(f"{f}=?"); vals.append(body[f])
+        if not fields:
+            return {"status": 400, "body": {"error": "No updatable fields"}}
+        fields.append("updated_at=CURRENT_TIMESTAMP")
+        vals.append(dgid)
+        conn.execute(f"UPDATE delivery_groups SET {', '.join(fields)} WHERE id=?", vals)
+        conn.commit()
+        row = conn.execute("SELECT * FROM delivery_groups WHERE id=?", [dgid]).fetchone()
+        return {"status": 200, "body": row_to_dict(row)}
+
+    if m and method == "DELETE":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        dgid = int(m["id"])
+        conn.execute("DELETE FROM delivery_group_items WHERE delivery_group_id=?", [dgid])
+        conn.execute("DELETE FROM delivery_groups WHERE id=?", [dgid])
+        conn.commit()
+        return {"status": 200, "body": {"message": "Delivery group deleted"}}
+
+    m = match("/delivery-groups/:id/items", path)
+    if m and method == "POST":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        dgid = int(m["id"])
+        if not body.get("order_item_id") or body.get("quantity") is None:
+            return {"status": 400, "body": {"error": "order_item_id and quantity are required"}}
+        dg_row = conn.execute("SELECT id FROM delivery_groups WHERE id=?", [dgid]).fetchone()
+        if not dg_row:
+            return {"status": 404, "body": {"error": "Delivery group not found"}}
+        cur = conn.execute(
+            "INSERT INTO delivery_group_items (delivery_group_id, order_item_id, quantity) VALUES (?,?,?)",
+            [dgid, body["order_item_id"], body["quantity"]]
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM delivery_group_items WHERE id=?", [cur.lastrowid]).fetchone()
+        return {"status": 201, "body": row_to_dict(row)}
+
+    m = match("/delivery-group-items/:id", path)
+    if m and method == "DELETE":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        dgi_id = int(m["id"])
+        conn.execute("DELETE FROM delivery_group_items WHERE id=?", [dgi_id])
+        conn.commit()
+        return {"status": 200, "body": {"message": "Item removed from delivery group"}}
 
     # 404
     return {"status": 404, "body": {"error": f"Route not found: {method} {path}"}}

@@ -2140,11 +2140,295 @@ const OverCapacityModal = ({ modal, token, onClose, onComplete }) => {
   );
 };
 
+// ─── ORDER DETAIL MODAL ──────────────────────────────────────────────────────
+// ─── ORDER SPLIT MODAL (Delivery Groups) ─────────────────────────────────────
+const OrderSplitModal = ({ orderId, orderItems, token, onClose, onSaved }) => {
+  const [groupName, setGroupName] = useState('');
+  const [deliveryDate, setDeliveryDate] = useState(localDateStr());
+  const [notes, setNotes] = useState('');
+  const [splits, setSplits] = useState([{ order_item_id: '', sku_code: '', quantity: '' }]);
+  const [stockInfo, setStockInfo] = useState({});
+  const [saving, setSaving] = useState(false);
+
+  const items = orderItems || [];
+
+  const fetchStock = async (skuId, idx) => {
+    if (!skuId) return;
+    try {
+      const s = await api(`/skus/${skuId}/stock`, {}, token);
+      setStockInfo(prev => ({ ...prev, [idx]: s }));
+    } catch {}
+  };
+
+  const updateSplit = (idx, key, val) => {
+    setSplits(prev => prev.map((s, i) => i === idx ? { ...s, [key]: val } : s));
+    if (key === 'order_item_id') {
+      const item = items.find(it => String(it.id) === String(val));
+      if (item) {
+        setSplits(prev => prev.map((s, i) => i === idx ? { ...s, order_item_id: val, sku_code: item.sku_code, quantity: '' } : s));
+        fetchStock(item.sku_id, idx);
+      }
+    }
+  };
+
+  const addSplit = () => setSplits(prev => [...prev, { order_item_id: '', sku_code: '', quantity: '' }]);
+  const removeSplit = (idx) => setSplits(prev => prev.filter((_, i) => i !== idx));
+
+  const handleSave = async () => {
+    if (!groupName.trim()) { toast('Enter a group name', 'error'); return; }
+    const validSplits = splits.filter(s => s.order_item_id && s.quantity > 0);
+    if (validSplits.length === 0) { toast('Add at least one line item with a quantity', 'error'); return; }
+    setSaving(true);
+    try {
+      const group = await api(`/orders/${orderId}/delivery-groups`, {
+        method: 'POST',
+        body: JSON.stringify({ group_name: groupName.trim(), requested_delivery_date: deliveryDate || null, notes: notes.trim() || null })
+      }, token);
+      const groupId = group.id;
+      for (const split of validSplits) {
+        await api(`/delivery-groups/${groupId}/items`, {
+          method: 'POST',
+          body: JSON.stringify({ order_item_id: parseInt(split.order_item_id), quantity: parseInt(split.quantity) })
+        }, token);
+      }
+      toast('Delivery group created', 'success');
+      onSaved && onSaved();
+      onClose();
+    } catch (e) { toast(e.message, 'error'); }
+    setSaving(false);
+  };
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',zIndex:950,display:'flex',alignItems:'center',justifyContent:'center',padding:'20px'}} onClick={onClose}>
+      <div style={{background:'white',borderRadius:16,padding:'24px',width:'100%',maxWidth:520,maxHeight:'90vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,0.3)'}} onClick={e=>e.stopPropagation()}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+          <div style={{fontSize:18,fontWeight:900,color:'#07324C'}}>Create Delivery Group</div>
+          <button onClick={onClose} style={{background:'none',border:'none',fontSize:26,color:'#9ca3af',cursor:'pointer'}}>×</button>
+        </div>
+
+        <div style={{marginBottom:12}}>
+          <label style={{fontSize:12,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:'0.06em',display:'block',marginBottom:4}}>Group Name</label>
+          <input value={groupName} onChange={e=>setGroupName(e.target.value)} placeholder="e.g. First Delivery"
+            style={{width:'100%',fontSize:14,padding:'7px 10px',borderRadius:6,border:'1px solid #d1d5db',boxSizing:'border-box'}} />
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:12}}>
+          <div>
+            <label style={{fontSize:12,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:'0.06em',display:'block',marginBottom:4}}>Delivery Date</label>
+            <input type="date" value={deliveryDate} onChange={e=>setDeliveryDate(e.target.value)}
+              style={{width:'100%',fontSize:14,padding:'7px 10px',borderRadius:6,border:'1px solid #d1d5db',boxSizing:'border-box'}} />
+          </div>
+          <div>
+            <label style={{fontSize:12,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:'0.06em',display:'block',marginBottom:4}}>Notes</label>
+            <input value={notes} onChange={e=>setNotes(e.target.value)} placeholder="Optional"
+              style={{width:'100%',fontSize:14,padding:'7px 10px',borderRadius:6,border:'1px solid #d1d5db',boxSizing:'border-box'}} />
+          </div>
+        </div>
+
+        <div style={{marginBottom:12}}>
+          <label style={{fontSize:12,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:'0.06em',display:'block',marginBottom:6}}>Line Items</label>
+          {splits.map((split, idx) => (
+            <div key={idx} style={{display:'grid',gridTemplateColumns:'1fr auto auto',gap:6,marginBottom:8,alignItems:'center'}}>
+              <select value={split.order_item_id}
+                onChange={e => updateSplit(idx, 'order_item_id', e.target.value)}
+                style={{fontSize:13,padding:'6px 8px',borderRadius:5,border:'1px solid #d1d5db',color:'#07324C'}}>
+                <option value="">Select SKU…</option>
+                {items.map(item => (
+                  <option key={item.id} value={item.id}>{item.sku_code || item.product_name} ({item.quantity||0} ordered)</option>
+                ))}
+              </select>
+              <div>
+                <input type="number" min="1" placeholder="Qty"
+                  value={split.quantity}
+                  onChange={e => updateSplit(idx, 'quantity', e.target.value)}
+                  style={{width:70,fontSize:13,padding:'6px 8px',borderRadius:5,border:'1px solid #d1d5db'}} />
+                {stockInfo[idx] && (
+                  <div style={{fontSize:11,color:'#16a34a',marginTop:2}}>Stock: {stockInfo[idx].finished_stock||0}</div>
+                )}
+              </div>
+              {splits.length > 1 && (
+                <button onClick={() => removeSplit(idx)} style={{background:'none',border:'none',fontSize:18,color:'#ef4444',cursor:'pointer',lineHeight:1}}>-</button>
+              )}
+            </div>
+          ))}
+          <button onClick={addSplit} style={{fontSize:13,color:'#07324C',background:'#f0f9ff',border:'1px solid #bae6fd',borderRadius:5,padding:'4px 12px',cursor:'pointer',fontWeight:600}}>+ Add Line</button>
+        </div>
+
+        <div style={{display:'flex',gap:8,justifyContent:'flex-end',borderTop:'1px solid #e2e8f0',paddingTop:14}}>
+          <button onClick={onClose} style={{background:'#f3f4f6',color:'#374151',border:'none',borderRadius:7,padding:'8px 16px',fontSize:14,fontWeight:600,cursor:'pointer'}}>Cancel</button>
+          <button onClick={handleSave} disabled={saving} style={{background:'#07324C',color:'white',border:'none',borderRadius:7,padding:'8px 20px',fontSize:14,fontWeight:700,cursor:'pointer'}}>
+            {saving ? 'Saving...' : 'Create Group'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─── ORDER DETAIL MODAL ──────────────────────────────────────────────────────
+const OrderDetailModal = ({ orderId, token, onClose, extraActions }) => {
+  const [order, setOrder] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [deliveryGroups, setDeliveryGroups] = useState([]);
+  const [showSplitModal, setShowSplitModal] = useState(false);
+
+  useEffect(() => {
+    if (!orderId) return;
+    const load = async () => {
+      setLoading(true);
+      try {
+        const [o, dg] = await Promise.all([
+          api(`/orders/${orderId}`, {}, token),
+          api(`/orders/${orderId}/delivery-groups`, {}, token).catch(() => []),
+        ]);
+        setOrder(o);
+        setDeliveryGroups(Array.isArray(dg) ? dg : []);
+      } catch (e) { toast(e.message, 'error'); }
+      setLoading(false);
+    };
+    load();
+  }, [orderId]);
+
+  const fmtDate = (d) => d ? new Date(d + 'T00:00:00').toLocaleDateString('en-AU', {day:'numeric',month:'short',year:'numeric'}) : '—';
+
+  const STATUS_MAP = { T:'Tendered', C:'Cut List / Docking', R:'Ready', P:'In Production', F:'Finished', dispatched:'Dispatched' };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:900,display:'flex',alignItems:'center',justifyContent:'center',padding:'20px'}}>
+      <div className="modal-card" onClick={e => e.stopPropagation()} style={{background:'white',borderRadius:16,padding:'24px',width:'100%',maxWidth:600,maxHeight:'90vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,0.3)'}}>
+        {/* Header */}
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
+          <div>
+            <div style={{fontSize:22,fontWeight:900,color:'#07324C'}}>{order?.order_number || 'Loading...'}</div>
+            {order?.client_name && <div style={{fontSize:15,color:'#6b7280',marginTop:2}}>{order.client_name}</div>}
+          </div>
+          <button onClick={onClose} style={{background:'none',border:'none',fontSize:28,color:'#9ca3af',cursor:'pointer',lineHeight:1,padding:'0 4px'}}>×</button>
+        </div>
+
+        {loading ? (
+          <div style={{textAlign:'center',padding:'32px',color:'#9ca3af'}}>Loading order details...</div>
+        ) : order ? (
+          <>
+            {/* Status + Delivery Date */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12,marginBottom:16}}>
+              <div style={{background:'#f8fafc',borderRadius:8,padding:'10px 14px'}}>
+                <div style={{fontSize:12,color:'#9ca3af',fontWeight:700,textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:4}}>Status</div>
+                <div style={{fontSize:15,fontWeight:700,color:'#07324C'}}>{STATUS_MAP[order.status] || order.status || '—'}</div>
+              </div>
+              <div style={{background:'#f8fafc',borderRadius:8,padding:'10px 14px'}}>
+                <div style={{fontSize:12,color:'#9ca3af',fontWeight:700,textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:4}}>Requested Delivery</div>
+                <div style={{fontSize:15,fontWeight:700,color: order.requested_delivery_date ? '#ef4444' : '#6b7280'}}>{fmtDate(order.requested_delivery_date)}</div>
+              </div>
+            </div>
+
+            {/* Line items */}
+            <div style={{marginBottom:16}}>
+              <div style={{fontSize:12,color:'#9ca3af',fontWeight:700,textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:8}}>Line Items</div>
+              {(order.items || order.order_items || []).length === 0 ? (
+                <div style={{color:'#9ca3af',fontSize:14,fontStyle:'italic'}}>No line items</div>
+              ) : (
+                <table style={{width:'100%',borderCollapse:'collapse',fontSize:14}}>
+                  <thead>
+                    <tr style={{borderBottom:'2px solid #e2e8f0'}}>
+                      <th style={{textAlign:'left',padding:'4px 6px',color:'#6b7280',fontWeight:700,fontSize:12}}>SKU</th>
+                      <th style={{textAlign:'right',padding:'4px 6px',color:'#6b7280',fontWeight:700,fontSize:12}}>Qty</th>
+                      <th style={{textAlign:'right',padding:'4px 6px',color:'#6b7280',fontWeight:700,fontSize:12}}>Produced</th>
+                      <th style={{textAlign:'left',padding:'4px 6px',color:'#6b7280',fontWeight:700,fontSize:12}}>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(order.items || order.order_items || []).map((item, i) => (
+                      <tr key={i} style={{borderBottom:'1px solid #f1f5f9'}}>
+                        <td style={{padding:'6px 6px',fontFamily:'monospace',fontWeight:700,color:'#07324C'}}>{item.sku_code || item.product_name || '—'}</td>
+                        <td style={{padding:'6px 6px',textAlign:'right',fontWeight:700}}>{(item.quantity||0).toLocaleString()}</td>
+                        <td style={{padding:'6px 6px',textAlign:'right',color:'#059669',fontWeight:700}}>{(item.produced_quantity||0).toLocaleString()}</td>
+                        <td style={{padding:'6px 6px'}}>
+                          <span style={{fontSize:12,padding:'2px 6px',borderRadius:4,background:'#f3f4f6',color:'#374141',fontWeight:600}}>
+                            {STATUS_MAP[item.status] || item.status || '—'}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            {/* Delivery Groups */}
+            <div style={{marginBottom:16}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+                <div style={{fontSize:12,color:'#9ca3af',fontWeight:700,textTransform:'uppercase',letterSpacing:'0.06em'}}>Delivery Groups ({deliveryGroups.length})</div>
+                <button onClick={() => setShowSplitModal(true)}
+                  style={{background:'#f0f9ff',color:'#0369a1',border:'1px solid #bae6fd',borderRadius:5,padding:'3px 10px',fontSize:12,fontWeight:700,cursor:'pointer'}}>
+                  + Create Group
+                </button>
+              </div>
+              {deliveryGroups.length > 0 && deliveryGroups.map(dg => (
+                <div key={dg.id} style={{background:'#f0f9ff',border:'1px solid #bae6fd',borderRadius:8,padding:'10px 12px',marginBottom:6}}>
+                  <div style={{fontWeight:700,color:'#0369a1',fontSize:14,marginBottom:4}}>{dg.group_name || `Group ${dg.id}`}</div>
+                  {dg.requested_delivery_date && <div style={{fontSize:13,color:'#0c4a6e'}}>Delivery: {fmtDate(dg.requested_delivery_date)}</div>}
+                  {dg.notes && <div style={{fontSize:13,color:'#6b7280',marginTop:2}}>{dg.notes}</div>}
+                  {(dg.items||[]).map((item,i) => (
+                    <div key={i} style={{fontSize:13,fontFamily:'monospace',color:'#07324C',marginTop:3}}>{item.sku_code || item.order_item_id} &#215; {item.quantity}</div>
+                  ))}
+                </div>
+              ))}
+            </div>
+
+            {/* Extra actions (e.g. dispatch-specific buttons) */}
+            {extraActions && <div style={{borderTop:'1px solid #e2e8f0',paddingTop:16,marginTop:4}}>{extraActions(order)}</div>}
+          </>
+        ) : (
+          <div style={{color:'#ef4444',padding:'16px',textAlign:'center'}}>Could not load order details.</div>
+        )}
+      </div>
+      {/* Order split modal */}
+      {showSplitModal && (
+        <OrderSplitModal
+          orderId={orderId}
+          orderItems={order?.items || order?.order_items || []}
+          token={token}
+          onClose={() => setShowSplitModal(false)}
+          onSaved={() => {
+            setShowSplitModal(false);
+            // Reload delivery groups
+            api(`/orders/${orderId}/delivery-groups`, {}, token).then(d => setDeliveryGroups(Array.isArray(d)?d:[])).catch(()=>{});
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
 // ---- Work Order Card (in grid) ----
-const WOCard = ({ entry, onRemove, onSplit, onEditQty, onDockingComplete, onReschedule, onAllocateInventory }) => {
+const WOCard = ({ entry, onRemove, onSplit, onEditQty, onDockingComplete, onReschedule, onAllocateInventory, token, onReload }) => {
   const [showMenu, setShowMenu] = useState(false);
   const [editingQty, setEditingQty] = useState(false);
   const [qtyVal, setQtyVal] = useState(entry.planned_quantity || 0);
+  const [statusChanging, setStatusChanging] = useState(false);
+  const [showOrderModal, setShowOrderModal] = useState(false);
+
+  const STATUS_ADVANCES = {
+    'T': [{ value: 'C', label: 'T → C (Issue Cut List)' }],
+    'C': [{ value: 'R', label: 'C → R (Docking Complete)' }],
+    'R': [],
+    'P': [],
+    'F': [],
+  };
+  const advances = STATUS_ADVANCES[entry.item_status] || [];
+
+  const handleStatusChange = async (newStatus) => {
+    if (!entry.order_item_id || statusChanging) return;
+    setStatusChanging(true);
+    try {
+      await api(`/order-items/${entry.order_item_id}/status`, {
+        method: 'PUT', body: JSON.stringify({ status: newStatus })
+      }, token);
+      toast(`Status → ${newStatus}`, 'success');
+      if (onReload) onReload();
+    } catch (e) { toast(e.message, 'error'); }
+    setStatusChanging(false);
+  };
 
   const isStock = entry.is_stock_run;
   const hasPriority = !!entry.requested_delivery_date;
@@ -2209,7 +2493,10 @@ const WOCard = ({ entry, onRemove, onSplit, onEditQty, onDockingComplete, onResc
             {isDocking && <span style={{background: entry.cut_list_issued ? '#d97706' : '#9ca3af',color:'white',fontSize:13,fontWeight:700,padding:'0 4px',borderRadius:3}}>{entry.cut_list_issued ? '🔶 DOCKING' : '⬜ AWAITING'}</span>}
             {isStock && <span style={{background:'#f59e0b',color:'white',fontSize:13,fontWeight:700,padding:'0 4px',borderRadius:3}}>STOCK</span>}
             {hasPriority && <span style={{background:'#ef4444',color:'white',fontSize:13,fontWeight:700,padding:'0 4px',borderRadius:3}}>⚡</span>}
-            <span style={{fontWeight:700,color: isDocking ? (entry.cut_list_issued ? '#92400e' : '#6b7280') : '#166534',fontSize:14,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{entry.order_number || '—'}</span>
+            <span style={{fontWeight:700,color: isDocking ? (entry.cut_list_issued ? '#92400e' : '#6b7280') : '#166534',fontSize:14,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',cursor: entry.order_id ? 'pointer' : 'default',textDecoration: entry.order_id ? 'underline' : 'none'}}
+              onClick={e => { if (entry.order_id) { e.stopPropagation(); setShowOrderModal(true); } }}>
+              {entry.order_number || '—'}
+            </span>
           </div>
           {/* SKU — bold and prominent per Tim's directive */}
           <div style={{fontFamily:'monospace',fontWeight:900,color:'#07324C',fontSize:14,lineHeight:1.2,marginTop:2}}>
@@ -2237,11 +2524,27 @@ const WOCard = ({ entry, onRemove, onSplit, onEditQty, onDockingComplete, onResc
           )}
         </div>
       </div>
+      {/* Stage advance dropdown */}
+      {advances.length > 0 && (
+        <div style={{marginTop:4}} onClick={e => e.stopPropagation()}>
+          <select
+            disabled={statusChanging}
+            value=""
+            onChange={e => { if (e.target.value) handleStatusChange(e.target.value); }}
+            style={{width:'100%',fontSize:12,padding:'2px 4px',borderRadius:3,border:'1px solid #07324C',color:'#07324C',background:'white',cursor:'pointer',opacity:statusChanging?0.5:1}}
+          >
+            <option value="">Advance stage…</option>
+            {advances.map(a => <option key={a.value} value={a.value}>{a.label}</option>)}
+          </select>
+        </div>
+      )}
+      {/* Order detail modal */}
+      {showOrderModal && entry.order_id && (
+        <OrderDetailModal orderId={entry.order_id} token={token} onClose={() => setShowOrderModal(false)} />
+      )}
     </div>
   );
 };
-
-// ---- Intake Queue Card ----
 const IntakeCard = ({ item, dragging, onDragStart, onDragEnd, onIssueCutList, onAllocateInventory }) => {
   const isStock = item.is_stock_run;
   const hasPriority = !!item.requested_delivery_date;
@@ -3136,6 +3439,8 @@ const PlanningBoard = ({ token, user }) => {
                                   onRemove={removeEntry}
                                   onSplit={setSplitEntry}
                                   onEditQty={editQty}
+                                  token={token}
+                                  onReload={() => loadRef.current()}
                                   onDockingComplete={async (e) => {
                                     try {
                                       // Prefer item-level endpoint; fall back to order-level
@@ -3261,6 +3566,7 @@ const ProductionManager = ({ token }) => {
   const [loading, setLoading] = useState(true);
   const [dateFilter, setDateFilter] = useState(localDateStr());
   const [numDays, setNumDays] = useState(1);
+  const [orderModal, setOrderModal] = useState(null); // order_id to show detail modal
 
   const activeZoneObj = zones.find(z => z.id === activeZone);
   const zoneStations = stations.filter(s => s.zone_id === activeZone);
@@ -3442,7 +3748,7 @@ const ProductionManager = ({ token }) => {
               <div className="space-y-2" style={{maxHeight:'calc(100vh - 320px)',overflowY:'auto'}}>
                 {unassigned.map(entry => (
                   <div key={entry.id} style={{background:'#fffbeb',border:'1px solid #fbbf24',borderRadius:8,padding:'8px 10px'}}>
-                    <div className="font-bold text-[#07324C]" style={{fontSize:14}}>{entry.order_number||'—'}</div>
+                    <div className="font-bold text-[#07324C]" style={{fontSize:14,cursor:entry.order_id?'pointer':'default',textDecoration:entry.order_id?'underline':'none'}} onClick={() => entry.order_id && setOrderModal(entry.order_id)}>{entry.order_number||'—'}</div>
                     <div className="text-gray-500" style={{fontSize:15}}>{entry.client_name||''}</div>
                     <div className="text-gray-500" style={{fontSize:15}}>
                       <span style={{fontFamily:'monospace',fontWeight:900,color:'#07324C',fontSize:14}}>{entry.sku_code || '—'}</span>
@@ -3505,7 +3811,7 @@ const ProductionManager = ({ token }) => {
                           <div key={entry.id} style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderLeft:`3px solid ${borderColor}`,borderRadius:6,padding:'6px 8px'}}>
                             <div className="flex items-start justify-between">
                               <div>
-                                <div className="font-bold text-[#07324C]" style={{fontSize:15}}>{entry.order_number||'—'}</div>
+                                <div className="font-bold text-[#07324C]" style={{fontSize:15,cursor:entry.order_id?'pointer':'default',textDecoration:entry.order_id?'underline':'none'}} onClick={() => entry.order_id && setOrderModal(entry.order_id)}>{entry.order_number||'—'}</div>
                                 <div className="text-gray-500" style={{fontSize:14}}>{entry.client_name||''}</div>
                                 <div style={{fontFamily:'monospace',fontWeight:900,color:'#07324C',fontSize:14,lineHeight:1.2,marginTop:1}}>
                                   {entry.sku_code || entry.product_name || '—'}
@@ -3537,6 +3843,27 @@ const ProductionManager = ({ token }) => {
                                   onClick={()=>moveStatus(entry.id,'completed')}>Complete</button>
                               )}
                             </div>
+                            {/* Stage advance dropdown for planners */}
+                            {entry.order_item_id && (['T','C'].includes(itemStatus)) && (
+                              <div style={{marginTop:4}}>
+                                <select
+                                  value=""
+                                  onChange={async e => {
+                                    if (!e.target.value) return;
+                                    try {
+                                      await api(`/order-items/${entry.order_item_id}/status`, { method:'PUT', body:JSON.stringify({status:e.target.value}) }, token);
+                                      toast(`Stage → ${e.target.value}`, 'success');
+                                      reload();
+                                    } catch(err) { toast(err.message, 'error'); }
+                                  }}
+                                  style={{width:'100%',fontSize:12,padding:'2px 4px',borderRadius:3,border:'1px solid #07324C',color:'#07324C',background:'white',cursor:'pointer'}}
+                                >
+                                  <option value="">Advance stage…</option>
+                                  {itemStatus === 'T' && <option value="C">T → C (Issue Cut List)</option>}
+                                  {itemStatus === 'C' && <option value="R">C → R (Docking Complete)</option>}
+                                </select>
+                              </div>
+                            )}
                           </div>
                           );
                         })}
@@ -3551,11 +3878,11 @@ const ProductionManager = ({ token }) => {
         </>
       )}
     </div>
+    {/* Order detail modal */}
+    {orderModal && <OrderDetailModal orderId={orderModal} token={token} onClose={() => setOrderModal(null)} />}
   );
 };
 
-// ═══════════════════════════════════════════════════════════════
-// PRODUCTION FLOOR OVERVIEW — Zone-by-zone real-time view
 // ═══════════════════════════════════════════════════════════════
 const ZONE_COLORS = {
   VIK: { bg: '#07324C', accent: '#1d4ed8', light: '#dbeafe', border: '#1d4ed8' },
@@ -4686,11 +5013,12 @@ const KanbanLegend = () => (
 );
 
 // Dispatch delivery card for the board
-const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggleType, token, compact }) => {
+const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggleType, token, compact, onEdit }) => {
   const isOverdue = entry.expected_date && entry.expected_date < localDateStr();
   const allDone = entry.all_finished;
   const [editingMins, setEditingMins] = useState(false);
   const [minsVal, setMinsVal] = useState(entry.estimated_minutes || '');
+  const [showOrderModal, setShowOrderModal] = useState(false);
 
   const kanbanKey = entry.order_kanban || entry.kanban_status || 'red_pending';
   const kanbanColor = getKanbanColor(kanbanKey);
@@ -4735,12 +5063,16 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
               background: kanbanColor,
               border: kanbanInfo.ring ? '2px solid #991b1b' : kanbanInfo.border || 'none',
             }} title={kanbanLabel} />
-            <span style={{fontWeight:800,color:'#07324C',fontSize: compact?14:15,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
+            <span style={{fontWeight:800,color:'#07324C',fontSize: compact?14:15,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',cursor:entry.order_id?'pointer':'default',textDecoration:entry.order_id?'underline':'none'}}
+              onClick={() => entry.order_id && setShowOrderModal(true)}>
               {entry.order_number}
             </span>
           </div>
           <div style={{fontSize: compact?13:14,color:'#6b7280',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_name || '—'}</div>
           {!compact && entry.client_address && <div style={{fontSize:13,color:'#9ca3af',marginTop:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_address}</div>}
+          {(entry.requested_delivery_date || entry.eta_date) && (
+            <div style={{fontSize:12,color:'#ef4444',fontWeight:700,marginTop:1}}>Del: {(() => { const d = entry.requested_delivery_date || entry.eta_date; try { return new Date(d+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}); } catch{return d;} })()}</div>
+          )}
         </div>
         <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:2,flexShrink:0}}>
           <StatusBadge status={entry.status || 'pending'} />
@@ -4825,8 +5157,117 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
             <button style={{fontSize:14,padding:'3px 8px',borderRadius:4,background:'#16a34a',color:'white',border:'none',cursor:'pointer',fontWeight:700}}
               onClick={() => onAction(entry.order_id, 'delivered')}>✓ Delivered</button>
           ) : null}
+          {onEdit && (
+            <button style={{fontSize:13,padding:'3px 8px',borderRadius:4,background:'#f0f9ff',color:'#0369a1',border:'1px solid #bae6fd',cursor:'pointer',fontWeight:600}}
+              onClick={() => onEdit(entry)}>✎ Edit</button>
+          )}
         </div>
       )}
+    </div>
+    {/* Order detail modal */}
+    {showOrderModal && entry.order_id && (
+      <OrderDetailModal orderId={entry.order_id} token={token} onClose={() => setShowOrderModal(false)} />
+    )}
+  );
+};
+
+// ─── DISPATCH EDIT MODAL ───────────────────────────────────────────────────
+const DispatchEditModal = ({ entry, token, onClose, onSave }) => {
+  const [notes, setNotes] = useState(entry.notes || '');
+  const [newDate, setNewDate] = useState(entry.expected_date || localDateStr());
+  const [saving, setSaving] = useState(false);
+
+  const handleReschedule = async () => {
+    if (!newDate || newDate === entry.expected_date) { onClose(); return; }
+    setSaving(true);
+    try {
+      await api(`/delivery-log/${entry.id}`, { method:'PUT', body: JSON.stringify({ expected_date: newDate }) }, token);
+      toast('Rescheduled to ' + newDate, 'success');
+      onSave && onSave();
+      onClose();
+    } catch (e) { toast(e.message, 'error'); }
+    setSaving(false);
+  };
+
+  const handleUnassign = async () => {
+    if (!await confirmAction('Remove from scheduled run and return to intake queue?', { title: 'Unassign Delivery', confirmText: 'Unassign', danger: true })) return;
+    setSaving(true);
+    try {
+      await api(`/delivery-log/${entry.id}`, { method:'PUT', body: JSON.stringify({ run_id: null, expected_date: null }) }, token);
+      toast('Unassigned — returned to intake queue', 'success');
+      onSave && onSave();
+      onClose();
+    } catch (e) { toast(e.message, 'error'); }
+    setSaving(false);
+  };
+
+  const handleSaveNotes = async () => {
+    setSaving(true);
+    try {
+      await api(`/delivery-log/${entry.id}`, { method:'PUT', body: JSON.stringify({ notes }) }, token);
+      toast('Notes saved', 'success');
+      onSave && onSave();
+    } catch (e) { toast(e.message, 'error'); }
+    setSaving(false);
+  };
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:900,display:'flex',alignItems:'center',justifyContent:'center',padding:'20px'}} onClick={onClose}>
+      <div style={{background:'white',borderRadius:16,padding:'24px',width:'100%',maxWidth:480,maxHeight:'90vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,0.3)'}} onClick={e => e.stopPropagation()}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:16}}>
+          <div>
+            <div style={{fontSize:20,fontWeight:900,color:'#07324C'}}>{entry.order_number}</div>
+            <div style={{fontSize:14,color:'#6b7280',marginTop:2}}>{entry.client_name}</div>
+          </div>
+          <button onClick={onClose} style={{background:'none',border:'none',fontSize:26,color:'#9ca3af',cursor:'pointer',lineHeight:1}}>×</button>
+        </div>
+
+        {/* Reschedule */}
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:12,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:6}}>Reschedule</div>
+          <div style={{display:'flex',gap:8,alignItems:'center'}}>
+            <input type="date" value={newDate} onChange={e => setNewDate(e.target.value)}
+              style={{flex:1,fontSize:14,padding:'6px 10px',borderRadius:6,border:'1px solid #d1d5db',color:'#07324C'}} />
+            <button onClick={handleReschedule} disabled={saving}
+              style={{background:'#07324C',color:'white',border:'none',borderRadius:6,padding:'7px 14px',fontSize:14,fontWeight:700,cursor:'pointer',whiteSpace:'nowrap'}}>
+              Save Date
+            </button>
+          </div>
+        </div>
+
+        {/* Notes */}
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:12,fontWeight:700,color:'#6b7280',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:6}}>Notes</div>
+          <textarea value={notes} onChange={e => setNotes(e.target.value)} rows={3}
+            style={{width:'100%',fontSize:14,padding:'8px 10px',borderRadius:6,border:'1px solid #d1d5db',resize:'vertical',boxSizing:'border-box'}} />
+          <button onClick={handleSaveNotes} disabled={saving}
+            style={{marginTop:6,background:'#f3f4f6',color:'#374151',border:'none',borderRadius:6,padding:'6px 14px',fontSize:14,fontWeight:600,cursor:'pointer'}}>
+            Save Notes
+          </button>
+        </div>
+
+        {/* Actions */}
+        <div style={{display:'flex',flexDirection:'column',gap:8,borderTop:'1px solid #e2e8f0',paddingTop:16}}>
+          <button onClick={handleUnassign} disabled={saving}
+            style={{background:'#fff7ed',color:'#c2410c',border:'1px solid #fed7aa',borderRadius:8,padding:'10px',fontSize:14,fontWeight:700,cursor:'pointer'}}>
+            ↩ Unassign (Return to Queue)
+          </button>
+          {entry.all_finished && (
+            <button onClick={async () => {
+              setSaving(true);
+              try {
+                await api(`/orders/${entry.order_id}/status`, { method:'PUT', body:JSON.stringify({status:'dispatched'}) }, token);
+                toast('Marked as Dispatched', 'success');
+                onSave && onSave(); onClose();
+              } catch(e) { toast(e.message, 'error'); }
+              setSaving(false);
+            }} disabled={saving}
+              style={{background:'#07324C',color:'white',border:'none',borderRadius:8,padding:'10px',fontSize:14,fontWeight:700,cursor:'pointer'}}>
+              🚚 Mark as Dispatched
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   );
 };
@@ -5184,6 +5625,8 @@ const DispatchDashboard = ({ token }) => {
   const [woFilter, setWoFilter] = useState({ truck_id: '', status: '' });
   const [contractorModal, setContractorModal] = useState(null); // order to assign
   const [overCapacityModal, setOverCapacityModal] = useState(null); // {info, pendingDrop}
+  const [dispatchOrderModal, setDispatchOrderModal] = useState(null); // order_id for detail modal
+  const [dispatchEditModal, setDispatchEditModal] = useState(null); // entry to edit
   const [rescheduleWOModal, setRescheduleWOModal] = useState(null); // {wo, newDate, newTruckId}
   const [rescheduleInfo, setRescheduleInfo] = useState(null); // delivery reschedule info
   // V2 planning state
@@ -5877,7 +6320,7 @@ const DispatchDashboard = ({ token }) => {
                         All deliveries assigned
                       </div>
                     ) : unassigned.map(entry => (
-                      <DispatchCard key={entry.id} entry={entry} trucks={allTrucks} onAssign={assignTruck} onAction={statusAction} onToggleType={toggleDispatchDeliveryType} token={token} compact={true} />
+                      <DispatchCard key={entry.id} entry={entry} trucks={allTrucks} onAssign={assignTruck} onAction={statusAction} onToggleType={toggleDispatchDeliveryType} token={token} compact={true} onEdit={e => setDispatchEditModal(e)} />
                     ))}
                   </div>
                 </>
@@ -6049,9 +6492,11 @@ const DispatchDashboard = ({ token }) => {
                                           <div style={{flex:1,minWidth:0}}>
                                             <div style={{display:'flex',alignItems:'center',gap:4}}>
                                               <span style={{width:8,height:8,borderRadius:'50%',background:entry.kanban_color||getKanbanColor(entry.kanban_status),flexShrink:0,display:'inline-block'}} title={entry.kanban_label} />
-                                              <span style={{fontWeight:800,color:'#07324C',fontSize:14,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.order_number}</span>
+                                              <span style={{fontWeight:800,color:'#07324C',fontSize:14,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',cursor:entry.order_id?'pointer':'default',textDecoration:entry.order_id?'underline':'none'}}
+                                                onClick={() => entry.order_id && setDispatchOrderModal(entry.order_id)}>{entry.order_number}</span>
                                             </div>
                                             <div style={{fontSize:13,color:'#6b7280',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_name}</div>
+                                            {entry.requested_delivery_date && <div style={{fontSize:12,color:'#ef4444',fontWeight:700}}>Del: {(() => { try { return new Date(entry.requested_delivery_date+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}); } catch{return entry.requested_delivery_date;} })()}</div>}
                                             {entry.sku_summary && <div style={{fontSize:12,fontFamily:'monospace',fontWeight:700,color:'#07324C',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.sku_summary}</div>}
                                           </div>
                                           <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:2,flexShrink:0}}>
@@ -6225,6 +6670,19 @@ const DispatchDashboard = ({ token }) => {
         />
       )}
     </div>
+    {/* Order detail modal for dispatch planning */}
+    {dispatchOrderModal && (
+      <OrderDetailModal orderId={dispatchOrderModal} token={token} onClose={() => setDispatchOrderModal(null)} />
+    )}
+    {/* Dispatch edit modal */}
+    {dispatchEditModal && (
+      <DispatchEditModal
+        entry={dispatchEditModal}
+        token={token}
+        onClose={() => setDispatchEditModal(null)}
+        onSave={() => { setDispatchEditModal(null); reload(); }}
+      />
+    )}
   );
 };
 
@@ -8600,6 +9058,9 @@ const TimberInventoryTab = ({ token, user }) => {
   const [sortDir, setSortDir] = useState('asc');
   const [fifoThreshold, setFifoThreshold] = useState(30);
   const [summary, setSummary] = useState(null);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [addForm, setAddForm] = useState({ pack_number:'', species:'', grade:'', length:'', width:'', thickness:'', quantity:'', board_metres:'', location:'', notes:'' });
+  const [addSaving, setAddSaving] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -8662,6 +9123,35 @@ const TimberInventoryTab = ({ token, user }) => {
 
   if (loading) return <div className="flex justify-center py-12"><Spinner /></div>;
 
+  const handleAddPack = async (e) => {
+    e.preventDefault();
+    if (!addForm.pack_number.trim()) { toast('Pack number required', 'error'); return; }
+    setAddSaving(true);
+    try {
+      const payload = {
+        qr_code: addForm.pack_number.trim(),
+        myob_code: [addForm.species, addForm.grade].filter(Boolean).join('-') || null,
+        notes: [
+          addForm.thickness && `${addForm.thickness}mm thick`,
+          addForm.width && `${addForm.width}mm wide`,
+          addForm.length && `${addForm.length}mm long`,
+          addForm.board_metres && `${addForm.board_metres} BM`,
+          addForm.location && `Loc: ${addForm.location}`,
+          addForm.notes
+        ].filter(Boolean).join('; ') || null,
+        volume_m3: addForm.board_metres ? (parseFloat(addForm.board_metres) / 424) : null,
+        pieces: addForm.quantity ? parseInt(addForm.quantity) : null,
+        status: 'inventory',
+      };
+      await api('/timber/packs', { method:'POST', body: JSON.stringify(payload) }, token);
+      toast('Timber pack added', 'success');
+      setAddForm({ pack_number:'', species:'', grade:'', length:'', width:'', thickness:'', quantity:'', board_metres:'', location:'', notes:'' });
+      setShowAddForm(false);
+      load();
+    } catch(err) { toast(err.message || 'Failed to add pack', 'error'); }
+    setAddSaving(false);
+  };
+
   return (
     <div className="space-y-4">
       {/* Summary cards */}
@@ -8703,6 +9193,9 @@ const TimberInventoryTab = ({ token, user }) => {
           <option value="">All Types</option>
           {typeOptions.map(t => <option key={t} value={t}>{t}</option>)}
         </select>
+        <button className="btn btn-primary btn-sm" style={{marginLeft:'auto'}} onClick={() => setShowAddForm(f=>!f)}>
+          {showAddForm ? '× Cancel' : '+ Add Timber Pack'}
+        </button>
         <div style={{ display: 'flex', gap: 0, marginLeft: 'auto', background: '#e5e7eb', borderRadius: 7, overflow: 'hidden' }}>
           {[['m3', 'm³'], ['pieces', 'Pcs'], ['lineal', 'Lineal m']].map(([v, l]) => (
             <button key={v}
@@ -8712,6 +9205,61 @@ const TimberInventoryTab = ({ token, user }) => {
         </div>
         <button className="btn btn-secondary btn-sm" onClick={load}><Icon name="RefreshCw" size={16} /></button>
       </div>
+
+      {/* Manual add timber pack form */}
+      {showAddForm && (
+        <div className="hp-card" style={{borderLeft:'3px solid #07324C'}}>
+          <div style={{fontSize:15,fontWeight:800,color:'#07324C',marginBottom:12}}>Add Timber Pack Manually</div>
+          <form onSubmit={handleAddPack}>
+            <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(160px,1fr))',gap:10,marginBottom:12}}>
+              <div>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Pack Number *</label>
+                <input className="hp-input" value={addForm.pack_number} onChange={e=>setAddForm(f=>({...f,pack_number:e.target.value}))} placeholder="e.g. EP-00123" required style={{width:'100%'}} />
+              </div>
+              <div>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Species / Spec</label>
+                <input className="hp-input" value={addForm.species} onChange={e=>setAddForm(f=>({...f,species:e.target.value}))} placeholder="e.g. F27" style={{width:'100%'}} />
+              </div>
+              <div>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Grade</label>
+                <input className="hp-input" value={addForm.grade} onChange={e=>setAddForm(f=>({...f,grade:e.target.value}))} placeholder="e.g. A" style={{width:'100%'}} />
+              </div>
+              <div>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Length (mm)</label>
+                <input className="hp-input" type="number" value={addForm.length} onChange={e=>setAddForm(f=>({...f,length:e.target.value}))} placeholder="e.g. 4800" style={{width:'100%'}} />
+              </div>
+              <div>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Width (mm)</label>
+                <input className="hp-input" type="number" value={addForm.width} onChange={e=>setAddForm(f=>({...f,width:e.target.value}))} placeholder="e.g. 100" style={{width:'100%'}} />
+              </div>
+              <div>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Thickness (mm)</label>
+                <input className="hp-input" type="number" value={addForm.thickness} onChange={e=>setAddForm(f=>({...f,thickness:e.target.value}))} placeholder="e.g. 50" style={{width:'100%'}} />
+              </div>
+              <div>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Quantity (pieces)</label>
+                <input className="hp-input" type="number" value={addForm.quantity} onChange={e=>setAddForm(f=>({...f,quantity:e.target.value}))} placeholder="e.g. 120" style={{width:'100%'}} />
+              </div>
+              <div>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Board Metres / M3</label>
+                <input className="hp-input" type="number" step="0.01" value={addForm.board_metres} onChange={e=>setAddForm(f=>({...f,board_metres:e.target.value}))} placeholder="e.g. 57.6" style={{width:'100%'}} />
+              </div>
+              <div>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Location</label>
+                <input className="hp-input" value={addForm.location} onChange={e=>setAddForm(f=>({...f,location:e.target.value}))} placeholder="e.g. Bay 3" style={{width:'100%'}} />
+              </div>
+              <div style={{gridColumn:'span 2'}}>
+                <label style={{fontSize:12,fontWeight:700,color:'#6b7280',display:'block',marginBottom:3}}>Notes</label>
+                <input className="hp-input" value={addForm.notes} onChange={e=>setAddForm(f=>({...f,notes:e.target.value}))} placeholder="Optional" style={{width:'100%'}} />
+              </div>
+            </div>
+            <div style={{display:'flex',gap:8}}>
+              <button type="submit" className="btn btn-primary" disabled={addSaving}>{addSaving?'Saving...':'Add Pack'}</button>
+              <button type="button" className="btn btn-secondary" onClick={()=>setShowAddForm(false)}>Cancel</button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* Table */}
       <div className="hp-card" style={{ padding: 0, overflow: 'hidden' }}>
