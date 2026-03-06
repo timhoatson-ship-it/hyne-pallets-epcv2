@@ -59,7 +59,7 @@ const api = async (path, options = {}, token = null) => {
   const res = await fetch(routeUrl, { ...options, headers });
   const text = await res.text();
   let data;
-  try { data = JSON.parse(text); } catch { data = { error: text }; }
+  try { data = JSON.parse(text); } catch(e) { data = { error: text }; }
   if (!res.ok) {
     if (res.status === 401) {
       // Token expired or invalid — clear session and redirect to login
@@ -2157,7 +2157,7 @@ const OrderSplitModal = ({ orderId, orderItems, token, onClose, onSaved }) => {
     try {
       const s = await api(`/skus/${skuId}/stock`, {}, token);
       setStockInfo(prev => ({ ...prev, [idx]: s }));
-    } catch {}
+    } catch(e) {}
   };
 
   const updateSplit = (idx, key, val) => {
@@ -2680,7 +2680,7 @@ const DropZone = ({ children, onDrop, isClosed, machineId, dateStr }) => {
         try {
           const data = JSON.parse(e.dataTransfer.getData('text/plain'));
           onDrop(dateStr, machineId, data);
-        } catch {}
+        } catch(e) {}
       }}
     >
       {children}
@@ -3265,7 +3265,7 @@ const PlanningBoard = ({ token, user }) => {
                       try {
                         const res = await api(`/orders/${item.order_id}/allocate-inventory`, {method:'POST', body:JSON.stringify({})}, token);
                         toast(`Inventory allocated (${res.allocated_items} item${res.allocated_items !== 1 ? 's' : ''}) — ready for dispatch`, 'success');
-                      } catch {
+                      } catch(e) {
                         await api('/inventory-allocate', {method:'POST', body:JSON.stringify({order_item_id: item.order_item_id || item.id})}, token);
                         toast('Inventory allocated — ready for dispatch', 'success');
                       }
@@ -3446,7 +3446,7 @@ const PlanningBoard = ({ token, user }) => {
                                       // Prefer item-level endpoint; fall back to order-level
                                       try {
                                         await api(`/order-items/${e.order_item_id}/docking-complete`, { method: 'PUT' }, token);
-                                      } catch {
+                                      } catch(e) {
                                         await api(`/orders/${e.order_id}/docking-complete`, { method: 'PUT' }, token);
                                       }
                                       toast('Docking complete — released for production', 'success');
@@ -4176,7 +4176,7 @@ const FloorTablet = ({ token, user }) => {
             const sp = await api(`/production/shared-progress/${session.item.id}`, {}, token).catch(()=>null);
             if (sp) setSharedProgress(sp);
           }
-        } catch {}
+        } catch(e) {}
       };
       refresh();
       intervalRef.current = setInterval(refresh, 15000);
@@ -5071,7 +5071,7 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
           <div style={{fontSize: compact?13:14,color:'#6b7280',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_name || '—'}</div>
           {!compact && entry.client_address && <div style={{fontSize:13,color:'#9ca3af',marginTop:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_address}</div>}
           {(entry.requested_delivery_date || entry.eta_date) && (
-            <div style={{fontSize:12,color:'#ef4444',fontWeight:700,marginTop:1}}>Del: {(() => { const d = entry.requested_delivery_date || entry.eta_date; try { return new Date(d+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}); } catch{return d;} })()}</div>
+            <div style={{fontSize:12,color:'#ef4444',fontWeight:700,marginTop:1}}>Del: {(() => { const d = entry.requested_delivery_date || entry.eta_date; try { return new Date(d+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}); } catch(e) {return d;} })()}</div>
           )}
         </div>
         <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:2,flexShrink:0}}>
@@ -5816,7 +5816,7 @@ const DispatchDashboard = ({ token }) => {
         to_truck_name: toTruck?.name || 'Unassigned',
         order_number: entry?.order_number || '',
       });
-    } catch {}
+    } catch(e) {}
   };
 
   const confirmReschedule = async () => {
@@ -6496,7 +6496,7 @@ const DispatchDashboard = ({ token }) => {
                                                 onClick={() => entry.order_id && setDispatchOrderModal(entry.order_id)}>{entry.order_number}</span>
                                             </div>
                                             <div style={{fontSize:13,color:'#6b7280',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_name}</div>
-                                            {entry.requested_delivery_date && <div style={{fontSize:12,color:'#ef4444',fontWeight:700}}>Del: {(() => { try { return new Date(entry.requested_delivery_date+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}); } catch{return entry.requested_delivery_date;} })()}</div>}
+                                            {entry.requested_delivery_date && <div style={{fontSize:12,color:'#ef4444',fontWeight:700}}>Del: {(() => { try { return new Date(entry.requested_delivery_date+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}); } catch(e) {return entry.requested_delivery_date;} })()}</div>}
                                             {entry.sku_summary && <div style={{fontSize:12,fontFamily:'monospace',fontWeight:700,color:'#07324C',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.sku_summary}</div>}
                                           </div>
                                           <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:2,flexShrink:0}}>
@@ -6714,7 +6714,7 @@ const PostProductionDashboard = ({ token }) => {
         try {
           const oi = await api(`/orders/${o.id}/items`, {}, token);
           oi.filter(i=>i.status==='F').forEach(i=>allItems.push({...i, order_number:o.order_number, client_name:o.client_name}));
-        } catch {}
+        } catch(e) {}
       }
       setFinishedItems(allItems);
     } catch (e) { toast(e.message,'error'); }
@@ -10239,7 +10239,7 @@ const ChainsawDockingWorkView = ({ token, user }) => {
       try {
         data = await api('/docking/jobs', {}, token);
         setJobs(Array.isArray(data) ? data : (data.jobs || []));
-      } catch {
+      } catch(e) {
         // Fallback: fetch orders and filter items in C status
         const orders = await api('/orders', {}, token);
         const cItems = [];
@@ -10275,7 +10275,7 @@ const ChainsawDockingWorkView = ({ token, user }) => {
     try {
       try {
         await api(`/order-items/${job.id}/docking-complete`, { method: 'PUT' }, token);
-      } catch {
+      } catch(e) {
         await api(`/orders/${job.order_id}/docking-complete`, { method: 'PUT' }, token);
       }
       toast('✓ Docking complete — ready for production', 'success');

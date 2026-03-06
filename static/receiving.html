@@ -72,7 +72,7 @@ const PinLogin = ({ onLogin }) => {
       } else {
         setError('Invalid PIN'); setPin('');
       }
-    } catch {
+    } catch(e) {
       setError('Invalid PIN — try again'); setPin('');
     }
     setLoading(false);
@@ -115,7 +115,7 @@ const App = () => {
             setNeedLogin(true);
           }
         }).catch(() => { localStorage.removeItem(SESSION_KEY); setNeedLogin(true); });
-      } catch { localStorage.removeItem(SESSION_KEY); setNeedLogin(true); }
+      } catch(e) { localStorage.removeItem(SESSION_KEY); setNeedLogin(true); }
     } else {
       setNeedLogin(true);
     }

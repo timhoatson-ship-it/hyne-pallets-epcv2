@@ -149,7 +149,7 @@ const api = async (path, options = {}, token = null) => {
   if (token) headers['Authorization'] = `Bearer ${token}`;
   const res = await fetch(API_BASE + path, { ...options, headers });
   const text = await res.text();
-  let data; try { data = JSON.parse(text); } catch { data = { error: text }; }
+  let data; try { data = JSON.parse(text); } catch(e) { data = { error: text }; }
   if (res.status === 401) { localStorage.removeItem('hyne_floor_session'); toast('Session expired — please log in again','error'); setTimeout(() => window.location.reload(), 1500); throw new Error('Session expired'); }
   if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`);
   return data;
@@ -249,7 +249,7 @@ const PinLogin = ({ onLogin }) => {
       } else {
         setError('Invalid PIN'); setPin('');
       }
-    } catch { setError('Invalid PIN — try again'); setPin(''); }
+    } catch(e) { setError('Invalid PIN — try again'); setPin(''); }
     setLoading(false);
   };
 
@@ -411,7 +411,7 @@ const SkuSearch = ({ token, zoneId, onSelect, placeholder }) => {
         const d = await api(`/skus/search?q=${encodeURIComponent(q)}${zoneId?`&zone_id=${zoneId}`:''}`,{},token);
         setResults(Array.isArray(d)?d:[]);
         setOpen(true);
-      } catch { setResults([]); }
+      } catch(e) { setResults([]); }
     },300);
   },[q]);
 
@@ -477,7 +477,7 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
       const params = skuId?`sku_id=${skuId}`:orderItemId?`order_item_id=${orderItemId}`:'';
       const d = await api(`/production/drawings?${params}`,{},token);
       setDrawings(Array.isArray(d)?d:[]);
-    } catch { setDrawings([]); }
+    } catch(e) { setDrawings([]); }
     finally { setDrawingsLoading(false); }
   };
 
@@ -1421,7 +1421,7 @@ const App = () => {
             setScreen('zone_select');
           }
         } else { setScreen('login'); }
-      } catch { setScreen('login'); }
+      } catch(e) { setScreen('login'); }
     }
   },[]);
 

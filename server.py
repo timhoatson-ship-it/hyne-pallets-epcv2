@@ -3991,6 +3991,44 @@ def dispatch(method, path, params, body, conn):
             except Exception as e:
                 return {"status": 409, "body": {"error": str(e)}}
 
+    # ----- ORDER ITEM STATUS (stage transition) -----
+    m = match("/order-items/:id/status", path)
+    if m and method == "PUT":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        iid = int(m["id"])
+        row = conn.execute("SELECT * FROM order_items WHERE id=?", [iid]).fetchone()
+        if not row:
+            return {"status": 404, "body": {"error": "Order item not found"}}
+        new_status = body.get("status")
+        valid_stages = ['T', 'C', 'R', 'P', 'F', 'dispatched']
+        if new_status not in valid_stages:
+            return {"status": 400, "body": {"error": f"Invalid status '{new_status}'. Must be one of {valid_stages}"}}
+        conn.execute(
+            "UPDATE order_items SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            [new_status, iid]
+        )
+        # If advancing to C, mark cut_list_issued
+        if new_status == 'C':
+            conn.execute(
+                "UPDATE order_items SET cut_list_issued=1, cut_list_issued_at=CURRENT_TIMESTAMP WHERE id=? AND cut_list_issued=0",
+                [iid]
+            )
+        # If advancing to R, mark docking_completed
+        if new_status == 'R':
+            conn.execute(
+                "UPDATE order_items SET docking_completed_at=CURRENT_TIMESTAMP WHERE id=? AND docking_completed_at IS NULL",
+                [iid]
+            )
+        conn.commit()
+        # Update kanban statuses for the parent order
+        try:
+            update_kanban_statuses(conn, row["order_id"])
+        except Exception:
+            pass
+        updated = conn.execute("SELECT * FROM order_items WHERE id=?", [iid]).fetchone()
+        return {"status": 200, "body": row_to_dict(updated)}
+
     m = match("/order-items/:id", path)
     if m and method == "PUT":
         if not current_user:
