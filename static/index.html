@@ -3705,6 +3705,7 @@ const ProductionManager = ({ token }) => {
       })();
 
   return (
+    <>
     <div className="p-6 space-y-4">
       {/* Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -3880,6 +3881,7 @@ const ProductionManager = ({ token }) => {
     </div>
     {/* Order detail modal */}
     {orderModal && <OrderDetailModal orderId={orderModal} token={token} onClose={() => setOrderModal(null)} />}
+    </>
   );
 };
 
@@ -5040,6 +5042,7 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
   };
 
   return (
+    <>
     <div
       draggable
       onDragStart={e => { e.dataTransfer.setData('text/plain', JSON.stringify({ dl_id: entry.id, delivery_log_id: entry.id, order_number: entry.order_number, estimated_minutes: entry.estimated_minutes || 30, from_truck: entry.truck_id, from_date: entry.expected_date })); if(onDragStart) onDragStart(entry); }}
@@ -5168,6 +5171,7 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
     {showOrderModal && entry.order_id && (
       <OrderDetailModal orderId={entry.order_id} token={token} onClose={() => setShowOrderModal(false)} />
     )}
+    </>
   );
 };
 
@@ -6250,6 +6254,7 @@ const DispatchDashboard = ({ token }) => {
   };
 
   return (
+    <>
     <div style={{display:'flex',flexDirection:'column',height:'calc(100vh - 56px)',overflow:'hidden'}}>
       {/* Toolbar — Row 1: Sub-page tabs */}
       <div style={{background:'#07324C',padding:'10px 16px 0',display:'flex',alignItems:'center',gap:12,flexShrink:0}}>
@@ -6683,6 +6688,7 @@ const DispatchDashboard = ({ token }) => {
         onSave={() => { setDispatchEditModal(null); reload(); }}
       />
     )}
+    </>
   );
 };
 
