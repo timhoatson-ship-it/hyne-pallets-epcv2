@@ -39,7 +39,7 @@ const api = async (path, options = {}, token = null) => {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers['Authorization'] = `Bearer ${token}`;
   const res = await fetch(API_BASE + path, { ...options, headers });
-  if (res.status === 401) { localStorage.removeItem(SESSION_KEY); window.location.reload(); throw new Error('Session expired'); }
+  if (res.status === 401) { if (token) { localStorage.removeItem(SESSION_KEY); window.location.reload(); } throw new Error('Authentication required'); }
   if (!res.ok) throw new Error(`API ${res.status}`);
   return res.json();
 };

@@ -154,7 +154,7 @@ const api = async (path, options = {}, token = null) => {
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); } catch(e) { data = { error: text }; }
-  if (res.status === 401) { localStorage.removeItem('driver_session'); window.location.reload(); throw new Error('Session expired'); }
+  if (res.status === 401) { if (token) { localStorage.removeItem('driver_session'); window.location.reload(); } throw new Error('Authentication required'); }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
 };
