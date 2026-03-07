@@ -4442,6 +4442,49 @@ def dispatch(method, path, params, body, conn):
                 se_row = conn.execute("SELECT order_item_id FROM schedule_entries WHERE id=?", [sid]).fetchone()
                 if se_row and se_row["order_item_id"]:
                     conn.execute("UPDATE order_items SET station_id=? WHERE id=?", [body["station_id"], se_row["order_item_id"]])
+            # --- Sync order_item pipeline status when schedule entry status changes ---
+            if "status" in body:
+                se_full = conn.execute("SELECT order_item_id, order_id FROM schedule_entries WHERE id=?", [sid]).fetchone()
+                oi_id = se_full["order_item_id"] if se_full else None
+                oi_order_id = se_full["order_id"] if se_full else None
+                if oi_id:
+                    item = conn.execute("SELECT * FROM order_items WHERE id=?", [oi_id]).fetchone()
+                    new_status = body["status"]
+                    if new_status == "in_progress" and item and item["status"] in ('T', 'C', 'R'):
+                        # Planner started job — promote item to P (Production)
+                        conn.execute("UPDATE order_items SET status='P' WHERE id=?", [oi_id])
+                        if oi_order_id:
+                            sync_order_status(conn, oi_order_id)
+                            update_kanban_statuses(conn, oi_order_id)
+                    elif new_status == "completed" and item and item["status"] in ('T', 'C', 'R', 'P'):
+                        # Planner completed job — check if production target met or force-complete
+                        total_produced = item["produced_quantity"] or 0
+                        target = item["quantity"] or 0
+                        if total_produced == 0:
+                            # No floor production recorded — assume full quantity produced
+                            total_produced = target
+                            conn.execute("UPDATE order_items SET produced_quantity=? WHERE id=?", [total_produced, oi_id])
+                        if total_produced >= target:
+                            # Create QA inspection to gate the F release (skip if one already exists)
+                            existing_qa = conn.execute(
+                                "SELECT id FROM qa_inspections WHERE order_item_id=? AND inspection_type='final'",
+                                [oi_id]
+                            ).fetchone()
+                            if not existing_qa:
+                                note = 'Auto-created: planner marked complete on Station Allocation'
+                                try:
+                                    conn.execute(
+                                        "INSERT INTO qa_inspections (order_item_id, inspection_type, batch_size, passed, notes) VALUES (?,?,?,?,?)",
+                                        [oi_id, 'final', total_produced, 0, note]
+                                    )
+                                except Exception:
+                                    pass
+                        if oi_order_id:
+                            sync_order_status(conn, oi_order_id)
+                            update_kanban_statuses(conn, oi_order_id)
+                sse_notify("schedule")
+                sse_notify("orders")
+                sse_notify("production")
             conn.commit()
             row = conn.execute("SELECT * FROM schedule_entries WHERE id=?", [sid]).fetchone()
             return {"status": 200, "body": row_to_dict(row)}
