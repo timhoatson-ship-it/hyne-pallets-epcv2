@@ -2807,8 +2807,8 @@ const MachineColHeader = ({ machine, slot }) => {
   );
 };
 
-const DockingBoard = ({ token, reload: parentReload }) => {
-  const [board, setBoard] = useState({ docking_required: [], cut_list_issued: [], docking_complete: [], in_production: [] });
+const DockingBoard = ({ token, reload: parentReload, dateFrom, dateTo }) => {
+  const [board, setBoard] = useState({ issue_cut_list: [], processing_at_chainsaw: [], cut_and_ready: [] });
   const [loading, setLoading] = useState(true);
   const [zoneFilter, setZoneFilter] = useState('');
   const [zones, setZones] = useState([]);
@@ -2816,37 +2816,44 @@ const DockingBoard = ({ token, reload: parentReload }) => {
   const loadBoard = useCallback(async () => {
     setLoading(true);
     try {
+      const qp = new URLSearchParams();
+      if (zoneFilter) qp.set('zone_id', zoneFilter);
+      if (dateFrom) qp.set('date_from', dateFrom);
+      if (dateTo) qp.set('date_to', dateTo);
+      const qs = qp.toString() ? ('?' + qp.toString()) : '';
       const [data, zs] = await Promise.all([
-        api(`/docking/board${zoneFilter ? `?zone_id=${zoneFilter}` : ''}`, {}, token),
-        api('/zones', {}, token).catch(() => [])
+        api('/docking/board' + qs, {}, token),
+        api('/zones', {}, token).catch(function() { return []; })
       ]);
       setBoard(data);
       setZones(zs);
     } catch(e) { toast(e.message, 'error'); }
     setLoading(false);
-  }, [token, zoneFilter]);
+  }, [token, zoneFilter, dateFrom, dateTo]);
 
-  useEffect(() => { loadBoard(); }, [loadBoard]);
+  useEffect(function() { loadBoard(); }, [loadBoard]);
 
   // Auto-refresh every 30 seconds
-  useEffect(() => {
-    const t = setInterval(() => { loadBoard(); }, 30000);
-    return () => clearInterval(t);
+  useEffect(function() {
+    var t = setInterval(function() { loadBoard(); }, 30000);
+    return function() { clearInterval(t); };
   }, [loadBoard]);
 
+  // Send it: promote T->C (Issue Cut List -> Processing at Chainsaw)
   const handleSendIt = async (itemId) => {
     try {
-      // Promote T→C via status endpoint (also sets cut_list_issued=1 automatically)
-      await api(`/order-items/${itemId}/status`, { method: 'PUT', body: JSON.stringify({ status: 'C' }) }, token);
-      toast('Cut list issued — moved to docking', 'success');
+      await api('/order-items/' + itemId + '/status', { method: 'PUT', body: JSON.stringify({ status: 'C' }) }, token);
+      toast('Cut list issued \u2014 sent to chainsaw', 'success');
       loadBoard();
+      if (parentReload) parentReload();
     } catch(e) { toast(e.message, 'error'); }
   };
 
+  // Docking Complete: promote C->R (Processing at Chainsaw -> Cut and Ready)
   const handleDockingComplete = async (itemId) => {
     try {
-      await api(`/order-items/${itemId}/docking-complete`, { method: 'PUT' }, token);
-      toast('Docking complete — ready for production', 'success');
+      await api('/order-items/' + itemId + '/docking-complete', { method: 'PUT' }, token);
+      toast('Docking complete \u2014 cut and ready', 'success');
       loadBoard();
       if (parentReload) parentReload();
     } catch(e) { toast(e.message, 'error'); }
@@ -2863,11 +2870,11 @@ const DockingBoard = ({ token, reload: parentReload }) => {
           {(item.quantity||0).toLocaleString()}
         </span>
       </div>
-      <div style={{fontFamily:'monospace',fontWeight:800,color:'#374151',fontSize:14,marginBottom:2}}>{item.sku_code||'—'}</div>
+      <div style={{fontFamily:'monospace',fontWeight:800,color:'#374151',fontSize:14,marginBottom:2}}>{item.sku_code||'\u2014'}</div>
       {item.client_name && <div style={{color:'#6b7280',fontSize:13,marginBottom:2}}>{item.client_name}</div>}
       <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:6}}>
         {item.zone_name && <span style={{background:'#f1f5f9',color:'#475569',fontSize:12,fontWeight:600,padding:'1px 6px',borderRadius:4}}>{item.zone_name}</span>}
-        {item.scheduled_date && <span style={{background:'#f1f5f9',color:'#475569',fontSize:12,fontWeight:600,padding:'1px 6px',borderRadius:4}}>{new Date(item.scheduled_date+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'})}</span>}
+        {(item.sched_date || item.scheduled_date) && <span style={{background:'#f1f5f9',color:'#475569',fontSize:12,fontWeight:600,padding:'1px 6px',borderRadius:4}}>{new Date((item.sched_date||item.scheduled_date)+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'})}</span>}
       </div>
       {actions}
     </div>
@@ -2875,68 +2882,75 @@ const DockingBoard = ({ token, reload: parentReload }) => {
 
   if (loading) return <div style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center'}}><Spinner /></div>;
 
+  const col1 = board.issue_cut_list || [];
+  const col2 = board.processing_at_chainsaw || [];
+  const col3 = board.cut_and_ready || [];
+
   return (
     <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',background:'#F5F7FA'}}>
       {/* Toolbar */}
       <div style={{padding:'10px 16px',background:'white',borderBottom:'1px solid #e2e8f0',display:'flex',alignItems:'center',gap:10,flexShrink:0}}>
         <div style={{fontSize:16,fontWeight:800,color:'#07324C'}}>Docking Board</div>
-        <select value={zoneFilter} onChange={e=>setZoneFilter(e.target.value)} style={{border:'1px solid #d1d5db',borderRadius:6,padding:'4px 10px',fontSize:14}}>
+        <select value={zoneFilter} onChange={function(e){setZoneFilter(e.target.value);}} style={{border:'1px solid #d1d5db',borderRadius:6,padding:'4px 10px',fontSize:14}}>
           <option value="">All Zones</option>
-          {['VIK','HMP','DTL','CRT'].map(code => { const z = zones.find(zz=>zz.code===code); return z ? <option key={z.id} value={z.id}>{z.name}</option> : null; })}
+          {['VIK','HMP','DTL','CRT'].map(function(code) { var z = zones.find(function(zz){return zz.code===code;}); return z ? <option key={z.id} value={z.id}>{z.name}</option> : null; })}
         </select>
-        <button onClick={loadBoard} style={{background:'#07324C',color:'white',border:'none',borderRadius:6,padding:'5px 14px',fontSize:14,fontWeight:700,cursor:'pointer'}}>↺ Refresh</button>
+        <button onClick={loadBoard} style={{background:'#07324C',color:'white',border:'none',borderRadius:6,padding:'5px 14px',fontSize:14,fontWeight:700,cursor:'pointer'}}>{'\u21BA'} Refresh</button>
       </div>
-      {/* 3-Column Board */}
+      {/* 3-Column Board: Issue Cut List | Processing at Chainsaw | Cut and Ready */}
       <div style={{flex:1,display:'flex',gap:12,padding:12,overflow:'hidden'}}>
-        {/* Column 1: Docking Required — C items need docking work */}
+        {/* Column 1: Issue Cut List (RED) - T-status items scheduled for this date range */}
         <div style={{flex:1,display:'flex',flexDirection:'column',minWidth:0}}>
           <div style={{background:'#dc2626',color:'white',padding:'10px 14px',borderRadius:'8px 8px 0 0',fontWeight:800,fontSize:15,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-            <span>Docking Required</span>
-            <span style={{background:'rgba(255,255,255,0.25)',padding:'1px 8px',borderRadius:10,fontSize:13}}>{board.docking_required.length}</span>
+            <span>Issue Cut List</span>
+            <span style={{background:'rgba(255,255,255,0.25)',padding:'1px 8px',borderRadius:10,fontSize:13}}>{col1.length}</span>
           </div>
           <div style={{flex:1,overflowY:'auto',background:'#fef2f2',borderRadius:'0 0 8px 8px',padding:8,border:'1px solid #fecaca',borderTop:'none'}}>
-            {board.docking_required.length === 0 ? (
-              <div style={{textAlign:'center',color:'#9ca3af',fontSize:14,padding:'24px 8px'}}>No items awaiting docking</div>
-            ) : board.docking_required.map(item => (
+            {col1.length === 0 ? (
+              <div style={{textAlign:'center',color:'#9ca3af',fontSize:14,padding:'24px 8px'}}>No planned work orders for this period</div>
+            ) : col1.map(function(item) { return (
               <DockingCard key={item.id} item={item} actions={
-                <button onClick={() => handleDockingComplete(item.id)} style={{
+                <button onClick={function(){handleSendIt(item.id);}} style={{
                   width:'100%',background:'#dc2626',color:'white',border:'none',borderRadius:6,
+                  padding:'7px 0',fontSize:14,fontWeight:800,cursor:'pointer'
+                }}>Send it</button>
+              } />
+            );})}
+          </div>
+        </div>
+        {/* Column 2: Processing at Chainsaw (AMBER) - C-status items being docked/cut */}
+        <div style={{flex:1,display:'flex',flexDirection:'column',minWidth:0}}>
+          <div style={{background:'#f59e0b',color:'white',padding:'10px 14px',borderRadius:'8px 8px 0 0',fontWeight:800,fontSize:15,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <span>Processing at Chainsaw</span>
+            <span style={{background:'rgba(255,255,255,0.25)',padding:'1px 8px',borderRadius:10,fontSize:13}}>{col2.length}</span>
+          </div>
+          <div style={{flex:1,overflowY:'auto',background:'#fffbeb',borderRadius:'0 0 8px 8px',padding:8,border:'1px solid #fde68a',borderTop:'none'}}>
+            {col2.length === 0 ? (
+              <div style={{textAlign:'center',color:'#9ca3af',fontSize:14,padding:'24px 8px'}}>No items at chainsaw</div>
+            ) : col2.map(function(item) { return (
+              <DockingCard key={item.id} item={item} actions={
+                <button onClick={function(){handleDockingComplete(item.id);}} style={{
+                  width:'100%',background:'#f59e0b',color:'white',border:'none',borderRadius:6,
                   padding:'7px 0',fontSize:14,fontWeight:800,cursor:'pointer'
                 }}>Docking Complete</button>
               } />
-            ))}
+            );})}
           </div>
         </div>
-        {/* Column 2: Docking Complete */}
+        {/* Column 3: Cut and Ready (GREEN) - R-status items ready for production */}
         <div style={{flex:1,display:'flex',flexDirection:'column',minWidth:0}}>
           <div style={{background:'#16a34a',color:'white',padding:'10px 14px',borderRadius:'8px 8px 0 0',fontWeight:800,fontSize:15,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-            <span>Docking Complete</span>
-            <span style={{background:'rgba(255,255,255,0.25)',padding:'1px 8px',borderRadius:10,fontSize:13}}>{board.docking_complete.length}</span>
+            <span>Cut and Ready</span>
+            <span style={{background:'rgba(255,255,255,0.25)',padding:'1px 8px',borderRadius:10,fontSize:13}}>{col3.length}</span>
           </div>
           <div style={{flex:1,overflowY:'auto',background:'#f0fdf4',borderRadius:'0 0 8px 8px',padding:8,border:'1px solid #bbf7d0',borderTop:'none'}}>
-            {board.docking_complete.length === 0 ? (
-              <div style={{textAlign:'center',color:'#9ca3af',fontSize:14,padding:'24px 8px'}}>No completed docking items</div>
-            ) : board.docking_complete.map(item => (
+            {col3.length === 0 ? (
+              <div style={{textAlign:'center',color:'#9ca3af',fontSize:14,padding:'24px 8px'}}>No items ready for production</div>
+            ) : col3.map(function(item) { return (
               <DockingCard key={item.id} item={item} actions={
                 <div style={{background:'#dcfce7',color:'#166534',textAlign:'center',borderRadius:6,padding:'5px 0',fontSize:13,fontWeight:700}}>{'\u2713'} Ready for Production</div>
               } />
-            ))}
-          </div>
-        </div>
-        {/* Column 3: In Production */}
-        <div style={{flex:1,display:'flex',flexDirection:'column',minWidth:0}}>
-          <div style={{background:'#7c3aed',color:'white',padding:'10px 14px',borderRadius:'8px 8px 0 0',fontWeight:800,fontSize:15,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-            <span>In Production</span>
-            <span style={{background:'rgba(255,255,255,0.25)',padding:'1px 8px',borderRadius:10,fontSize:13}}>{(board.in_production||[]).length}</span>
-          </div>
-          <div style={{flex:1,overflowY:'auto',background:'#f5f3ff',borderRadius:'0 0 8px 8px',padding:8,border:'1px solid #ddd6fe',borderTop:'none'}}>
-            {(board.in_production||[]).length === 0 ? (
-              <div style={{textAlign:'center',color:'#9ca3af',fontSize:14,padding:'24px 8px'}}>No items in production</div>
-            ) : (board.in_production||[]).map(item => (
-              <DockingCard key={item.id} item={item} actions={
-                <div style={{background:'#ede9fe',color:'#6d28d9',textAlign:'center',borderRadius:6,padding:'5px 0',fontSize:13,fontWeight:700}}>{'\uD83D\uDD27'} Manufacturing</div>
-              } />
-            ))}
+            );})}
           </div>
         </div>
       </div>
@@ -3216,7 +3230,7 @@ const PlanningBoard = ({ token, user }) => {
         </div>
       ) : activeTab === 'dockinglog' ? (
         /* ── Docking Log — 3-Section Board ── */
-        <DockingBoard token={token} reload={reload} />
+        <DockingBoard token={token} reload={reload} dateFrom={fmtDate(weekStart)} dateTo={fmtDate(endDate)} />
       ) : (
         <div style={{flex:1,display:'flex',overflow:'hidden'}}>
 
@@ -3758,7 +3772,7 @@ const ProductionManager = ({ token }) => {
 
       {loading ? <div className="flex justify-center py-12"><Spinner /></div> : showDockingLog ? (
         <div style={{flex:1,minHeight:'calc(100vh - 250px)'}}>
-          <DockingBoard token={token} reload={reload} />
+          <DockingBoard token={token} reload={reload} dateFrom={dateFilter} dateTo={(function(){ var d=new Date(dateFilter+'T00:00:00'); d.setDate(d.getDate()+(numDays-1)); return localDateStr(d); })()} />
         </div>
       ) : (
         <>

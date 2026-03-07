@@ -3765,9 +3765,10 @@ def dispatch(method, path, params, body, conn):
     if method == "GET" and path == "/docking/board":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
-        if not current_user:
-            return {"status": 401, "body": {"error": "Authentication required"}}
         zone_filter = params.get("zone_id")
+        date_from = params.get("date_from")  # e.g. 2026-03-07
+        date_to = params.get("date_to")      # e.g. 2026-03-11
+
         base_q = """
             SELECT oi.*, o.order_number, o.client_id, c.company_name as client_name,
                    s.name as sku_name, z.name as zone_name, z.code as zone_code,
@@ -3784,42 +3785,57 @@ def dispatch(method, path, params, body, conn):
             )
         """
 
-        # Column 1 - Docking Required: items promoted to C that need docking work
-        # Items at status T stay on the Planning Board ONLY — they flow here after T→C
-        q1 = base_q + " WHERE oi.status='C'"
+        # ── Column 1: Issue Cut List ──
+        # All PLANNED work orders for the date period in view (status T with a schedule_entry)
+        # These are scheduled on the planning board but not yet sent to chainsaw
+        q1 = base_q + " WHERE oi.status='T' AND se.scheduled_date IS NOT NULL"
+        params_q1 = []
+        if date_from and date_to:
+            q1 += " AND se.scheduled_date >= ? AND se.scheduled_date <= ?"
+            params_q1.extend([date_from, date_to])
+        elif date_from:
+            q1 += " AND se.scheduled_date >= ?"
+            params_q1.append(date_from)
         if zone_filter:
             q1 += " AND oi.zone_id=?"
-            params_q1 = [int(zone_filter)]
-        else:
-            params_q1 = []
-        q1 += " ORDER BY sched_date ASC, o.order_number"
-        docking_required = rows_to_list(conn.execute(q1, params_q1).fetchall())
+            params_q1.append(int(zone_filter))
+        q1 += " ORDER BY se.scheduled_date ASC, o.order_number"
+        issue_cut_list = rows_to_list(conn.execute(q1, params_q1).fetchall())
 
-        # Column 2 - Docking Complete: status='R' (recently completed, ready for production)
-        q2 = base_q + " WHERE oi.status='R'"
+        # ── Column 2: Processing at Chainsaw ──
+        # Items promoted to C (T→C via Send it / Kanban dropdown) — actively being docked/cut
+        q2 = base_q + " WHERE oi.status='C'"
+        params_q2 = []
+        if date_from and date_to:
+            q2 += " AND (se.scheduled_date IS NULL OR (se.scheduled_date >= ? AND se.scheduled_date <= ?))"
+            params_q2.extend([date_from, date_to])
         if zone_filter:
             q2 += " AND oi.zone_id=?"
-            params_q2 = [int(zone_filter)]
-        else:
-            params_q2 = []
-        q2 += " ORDER BY COALESCE(oi.docking_completed_at, oi.updated_at, oi.created_at) DESC LIMIT 50"
-        docking_complete = rows_to_list(conn.execute(q2, params_q2).fetchall())
+            params_q2.append(int(zone_filter))
+        q2 += " ORDER BY COALESCE(se.scheduled_date, oi.updated_at) ASC, o.order_number"
+        processing_at_chainsaw = rows_to_list(conn.execute(q2, params_q2).fetchall())
 
-        # Column 3 - In Production: status='P' (already in production, for reference)
-        q3 = base_q + " WHERE oi.status='P'"
+        # ── Column 3: Cut and Ready ──
+        # Items at R (C→R via Docking Complete) — docking finished, ready for production
+        q3 = base_q + " WHERE oi.status='R'"
+        params_q3 = []
+        if date_from and date_to:
+            q3 += " AND (se.scheduled_date IS NULL OR (se.scheduled_date >= ? AND se.scheduled_date <= ?))"
+            params_q3.extend([date_from, date_to])
         if zone_filter:
             q3 += " AND oi.zone_id=?"
-            params_q3 = [int(zone_filter)]
-        else:
-            params_q3 = []
-        q3 += " ORDER BY oi.updated_at DESC LIMIT 50"
-        in_production = rows_to_list(conn.execute(q3, params_q3).fetchall())
+            params_q3.append(int(zone_filter))
+        q3 += " ORDER BY COALESCE(oi.docking_completed_at, oi.updated_at) DESC LIMIT 100"
+        cut_and_ready = rows_to_list(conn.execute(q3, params_q3).fetchall())
 
         return {"status": 200, "body": {
-            "docking_required": docking_required,
-            "cut_list_issued": docking_required,  # Same as col 1 for backward compat
-            "docking_complete": docking_complete,
-            "in_production": in_production
+            "issue_cut_list": issue_cut_list,
+            "processing_at_chainsaw": processing_at_chainsaw,
+            "cut_and_ready": cut_and_ready,
+            # Backward compat aliases
+            "docking_required": processing_at_chainsaw,
+            "cut_list_issued": issue_cut_list,
+            "docking_complete": cut_and_ready
         }}
 
     # ----- DELIVERY TYPE TOGGLE -----
