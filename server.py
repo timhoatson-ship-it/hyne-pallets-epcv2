@@ -16,8 +16,10 @@ import hmac
 import time
 import jwt as pyjwt  # PyJWT — industry-standard JWT library (replaces hand-rolled HMAC tokens)
 from datetime import datetime, timezone, timedelta
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify, send_from_directory, Response
 from flask_cors import CORS
+import queue
+import threading
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -30,6 +32,105 @@ CORS(app, origins=[
 ])
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+
+# ---------------------------------------------------------------------------
+# SSE (Server-Sent Events) — real-time push to all connected clients
+# ---------------------------------------------------------------------------
+
+class SSEBroker:
+    """Thread-safe broker that fans out events to all connected SSE clients.
+    Each client gets its own queue; broadcast() pushes to every queue.
+    """
+    def __init__(self):
+        self._clients = []  # list of queue.Queue
+        self._lock = threading.Lock()
+
+    def subscribe(self):
+        q = queue.Queue(maxsize=50)
+        with self._lock:
+            self._clients.append(q)
+        return q
+
+    def unsubscribe(self, q):
+        with self._lock:
+            try:
+                self._clients.remove(q)
+            except ValueError:
+                pass
+
+    def broadcast(self, channel, data=None):
+        """Push an event to every connected client.
+        channel: string like 'orders', 'docking', 'schedule', 'production', 'qa', 'dispatch'
+        data: optional dict of extra info (kept minimal — clients re-fetch on their own)
+        """
+        payload = json.dumps({"channel": channel, "ts": time.time(), **(data or {})})
+        msg = f"event: update\ndata: {payload}\n\n"
+        with self._lock:
+            dead = []
+            for q in self._clients:
+                try:
+                    q.put_nowait(msg)
+                except queue.Full:
+                    dead.append(q)
+            for q in dead:
+                try:
+                    self._clients.remove(q)
+                except ValueError:
+                    pass
+
+    @property
+    def client_count(self):
+        with self._lock:
+            return len(self._clients)
+
+sse_broker = SSEBroker()
+
+
+def sse_notify(channel, data=None):
+    """Convenience wrapper — call after any data mutation.
+    Example: sse_notify('orders')  or  sse_notify('docking', {'order_id': 42})
+    """
+    sse_broker.broadcast(channel, data)
+
+
+@app.route("/api/events")
+def sse_stream():
+    """SSE endpoint — clients hold this connection open and receive push events.
+    Heartbeat every 25 seconds keeps the connection alive through proxies/load balancers.
+    """
+    # Lightweight auth: require valid JWT in query string
+    tok = request.args.get("token", "")
+    if tok:
+        try:
+            secret = os.environ.get("JWT_SECRET", "change-me-in-production")
+            pyjwt.decode(tok, secret, algorithms=["HS256"])
+        except Exception:
+            return jsonify({"error": "Invalid token"}), 401
+
+    q = sse_broker.subscribe()
+
+    def stream():
+        try:
+            # Initial connection confirmation
+            yield "event: connected\ndata: {}\n\n"
+            while True:
+                try:
+                    msg = q.get(timeout=25)
+                    yield msg
+                except queue.Empty:
+                    # Heartbeat to keep connection alive
+                    yield ": heartbeat\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            sse_broker.unsubscribe(q)
+
+    resp = Response(stream(), mimetype="text/event-stream")
+    resp.headers["Cache-Control"] = "no-cache"
+    resp.headers["X-Accel-Buffering"] = "no"  # nginx/Railway proxy compatibility
+    resp.headers["Connection"] = "keep-alive"
+    return resp
+
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -3663,6 +3764,8 @@ def dispatch(method, path, params, body, conn):
             sync_order_status(conn, oid)
             update_kanban_statuses(conn, oid)
             log_audit(conn, current_user["id"], "docking_complete_forced", "orders", oid)
+            sse_notify("docking")
+            sse_notify("orders")
         else:
             # Standard: promote only C-status items to R
             conn.execute(
@@ -3673,6 +3776,8 @@ def dispatch(method, path, params, body, conn):
             sync_order_status(conn, oid)
             update_kanban_statuses(conn, oid)
             log_audit(conn, current_user["id"], "docking_complete", "orders", oid)
+            sse_notify("docking")
+            sse_notify("orders")
         return {"status": 200, "body": order_full(conn, oid)}
 
     # Cut list issued flag
@@ -3687,6 +3792,8 @@ def dispatch(method, path, params, body, conn):
         conn.execute("UPDATE order_items SET cut_list_issued=1, updated_at=CURRENT_TIMESTAMP WHERE id=?", [iid])
         conn.commit()
         log_audit(conn, current_user["id"], "cut_list_issued", "order_items", iid)
+        sse_notify("docking")
+        sse_notify("orders")
         return {"status": 200, "body": {"success": True}}
 
     # Single-item docking complete
@@ -3709,6 +3816,8 @@ def dispatch(method, path, params, body, conn):
         sync_order_status(conn, item_row["order_id"])
         update_kanban_statuses(conn, item_row["order_id"])
         log_audit(conn, current_user["id"], "item_docking_complete", "order_items", iid)
+        sse_notify("docking")
+        sse_notify("orders")
         updated = conn.execute("SELECT * FROM order_items WHERE id=?", [iid]).fetchone()
         return {"status": 200, "body": row_to_dict(updated)}
 
@@ -3913,6 +4022,10 @@ def dispatch(method, path, params, body, conn):
             conn.commit()
             update_kanban_statuses(conn, oid)
         log_audit(conn, current_user["id"], f"status_change_{old_status}_to_{new_status}", "orders", oid)
+        sse_notify("orders")
+        sse_notify("docking")
+        if new_status in ('dispatched', 'delivered', 'collected', 'F'):
+            sse_notify("dispatch")
         return {"status": 200, "body": order_full(conn, oid)}
 
     m = match("/orders/:id/eta", path)
@@ -3969,6 +4082,8 @@ def dispatch(method, path, params, body, conn):
             email_body = f"Order {order_row['order_number']} ETA Update:\n{items_text}"
             log_and_send_notification(conn, oid, "eta_notification", client["email"],
                 f"ETA Update for Order {order_row['order_number']}", email_body)
+        sse_notify("orders")
+        sse_notify("dispatch")
         return {"status": 200, "body": order_full(conn, oid)}
 
     # Per-item ETA endpoint
@@ -4143,6 +4258,9 @@ def dispatch(method, path, params, body, conn):
         except Exception:
             pass
         updated = conn.execute("SELECT * FROM order_items WHERE id=?", [iid]).fetchone()
+        sse_notify("orders")
+        sse_notify("docking")
+        sse_notify("schedule")
         return {"status": 200, "body": row_to_dict(updated)}
 
     m = match("/order-items/:id", path)
@@ -4218,6 +4336,8 @@ def dispatch(method, path, params, body, conn):
                 conn.commit()
                 # Sync order status from items (replaces direct status='C' set)
                 sync_order_status(conn, oid)
+                sse_notify("schedule")
+                sse_notify("orders")
                 row = conn.execute("SELECT * FROM schedule_entries WHERE id=?", [cur.lastrowid]).fetchone()
                 return {"status": 201, "body": row_to_dict(row)}
             except Exception as e:
@@ -4250,6 +4370,8 @@ def dispatch(method, path, params, body, conn):
             conn.commit()
             # Sync order status from items (replaces direct status='C' set)
             sync_order_status(conn, order_id)
+            sse_notify("schedule")
+            sse_notify("orders")
             if len(created_entries) == 1:
                 row = conn.execute("SELECT * FROM schedule_entries WHERE id=?", [created_entries[0]]).fetchone()
                 return {"status": 201, "body": row_to_dict(row)}
@@ -4480,6 +4602,9 @@ def dispatch(method, path, params, body, conn):
                         [se_planned["id"]]
                     )
             row = conn.execute("SELECT * FROM production_sessions WHERE id=?", [session_id]).fetchone()
+            sse_notify("production")
+            sse_notify("orders")
+            sse_notify("schedule")
             return {"status": 201, "body": row_to_dict(row)}
         except Exception as e:
             return {"status": 409, "body": {"error": str(e)}}
@@ -4616,6 +4741,9 @@ def dispatch(method, path, params, body, conn):
         else:
             conn.commit()
         log_audit(conn, current_user["id"], "complete_session", "production_sessions", sid)
+        sse_notify("production")
+        sse_notify("orders")
+        sse_notify("qa")
         row = conn.execute("SELECT * FROM production_sessions WHERE id=?", [sid]).fetchone()
         return {"status": 200, "body": row_to_dict(row)}
 
@@ -4833,6 +4961,10 @@ def dispatch(method, path, params, body, conn):
                         )
                         conn.commit()
         row = conn.execute("SELECT * FROM qa_inspections WHERE id=?", [iid]).fetchone()
+        sse_notify("qa")
+        sse_notify("orders")
+        sse_notify("production")
+        sse_notify("dispatch")
         return {"status": 200, "body": row_to_dict(row)}
 
     # ----- POST-PRODUCTION PROCESSES -----
@@ -5941,6 +6073,7 @@ def dispatch(method, path, params, body, conn):
             vals.append(int(dl_id))
             conn.execute(f"UPDATE delivery_log SET {', '.join(fields)} WHERE id=?", vals)
             conn.commit()
+        sse_notify("dispatch")
         row = conn.execute("""
             SELECT dl.*, o.order_number, c.company_name as client_name, t.name as truck_name, t.driver_name
             FROM delivery_log dl
@@ -6239,6 +6372,8 @@ def dispatch(method, path, params, body, conn):
             conn.execute("UPDATE order_items SET status='dispatched' WHERE order_id=? AND status='F'", [oid])
             update_kanban_statuses(conn, oid)
         conn.commit()
+        sse_notify("dispatch")
+        sse_notify("orders")
         return {"status": 200, "body": {"dispatched": True, "run_id": run_id}}
 
     # ----- DELIVERY CONFIRMED (driver confirms) -----
@@ -6256,6 +6391,8 @@ def dispatch(method, path, params, body, conn):
             conn.execute("UPDATE order_items SET status='delivered' WHERE order_id=? AND status='dispatched'", [order_id])
             update_kanban_statuses(conn, order_id)
         conn.commit()
+        sse_notify("dispatch")
+        sse_notify("orders")
         return {"status": 200, "body": {"delivered": True, "delivery_log_id": dl_id}}
 
     # ----- INVENTORY ALLOCATION (fast-track: stock -> dispatch ready) -----
@@ -7078,6 +7215,9 @@ def dispatch(method, path, params, body, conn):
                 [oid]
             )
             conn.commit()
+        sse_notify("orders")
+        sse_notify("production")
+        sse_notify("dispatch")
         return {"status": 200, "body": order_full(conn, oid)}
 
     # ----- CAPACITY CHECK (pre-drop validation) -----
@@ -7899,6 +8039,8 @@ def dispatch(method, path, params, body, conn):
                 update_kanban_statuses(conn, order_id_dl)
         else:
             conn.commit()
+        sse_notify("dispatch")
+        sse_notify("orders")
         return {"status": 200, "body": {"ok": True}}
 
     # ----- COMPLETE DELIVERY (triggers cost calc) -----

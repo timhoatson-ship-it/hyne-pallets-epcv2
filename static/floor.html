@@ -155,6 +155,86 @@ const api = async (path, options = {}, token = null) => {
   return data;
 };
 
+// ═══════════════════════════════════════════════════════════════
+// SSE Manager — Server-Sent Events for live updates
+// ═══════════════════════════════════════════════════════════════
+const SSEManager = (() => {
+  let eventSource = null;
+  let listeners = {};
+  let currentToken = null;
+  let reconnectTimer = null;
+  let reconnectDelay = 1000;
+
+  function connect(token) {
+    if (eventSource && currentToken === token) return;
+    disconnect();
+    currentToken = token;
+    if (!token) return;
+    const url = `${API_BASE}/events?token=${encodeURIComponent(token)}`;
+    eventSource = new EventSource(url);
+
+    eventSource.addEventListener('connected', () => {
+      reconnectDelay = 1000;
+      console.log('[SSE-Floor] Connected');
+    });
+
+    eventSource.addEventListener('update', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        const channel = data.channel;
+        if (channel && listeners[channel]) {
+          listeners[channel].forEach(fn => {
+            try { fn(data); } catch(err) { console.error('[SSE-Floor] listener error:', err); }
+          });
+        }
+      } catch(err) { console.error('[SSE-Floor] parse error:', err); }
+    });
+
+    eventSource.onerror = () => {
+      console.warn('[SSE-Floor] Connection lost, reconnecting...');
+      eventSource.close();
+      eventSource = null;
+      reconnectTimer = setTimeout(() => {
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+        connect(currentToken);
+      }, reconnectDelay);
+    };
+  }
+
+  function disconnect() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (eventSource) { eventSource.close(); eventSource = null; }
+    currentToken = null;
+  }
+
+  function subscribe(channel, callback) {
+    if (!listeners[channel]) listeners[channel] = new Set();
+    listeners[channel].add(callback);
+    return () => {
+      if (listeners[channel]) {
+        listeners[channel].delete(callback);
+        if (listeners[channel].size === 0) delete listeners[channel];
+      }
+    };
+  }
+
+  return { connect, disconnect, subscribe };
+})();
+
+const useSSE = (channels, callback, token) => {
+  const cbRef = React.useRef(callback);
+  React.useEffect(() => { cbRef.current = callback; });
+
+  React.useEffect(() => {
+    if (!token) return;
+    SSEManager.connect(token);
+    const unsubs = channels.map(ch =>
+      SSEManager.subscribe(ch, () => cbRef.current())
+    );
+    return () => unsubs.forEach(fn => fn());
+  }, [token, channels.join(',')]);
+};
+
 const fmtHMS = (sec) => {
   const s = Math.max(0, Math.floor(sec));
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), ss = s%60;
@@ -454,7 +534,6 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
   const [setupWo, setSetupWo] = useState(null);
   const [drawings, setDrawings] = useState([]);
   const [drawingsLoading, setDrawingsLoading] = useState(false);
-  const pollRef = useRef(null);
 
   const loadData = useCallback(async()=>{
     try {
@@ -465,11 +544,9 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
     finally { setLoading(false); }
   },[station, zone, token]);
 
-  useEffect(()=>{
-    loadData();
-    pollRef.current = setInterval(loadData, 5000);
-    return ()=>clearInterval(pollRef.current);
-  },[loadData]);
+  useEffect(()=>{ loadData(); },[loadData]);
+  // SSE: live-refresh station data on production/schedule events
+  useSSE(['production', 'schedule', 'orders', 'docking'], loadData, token);
 
   const loadDrawings = async(skuId, orderItemId)=>{
     setDrawingsLoading(true);
@@ -762,7 +839,6 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
   const [subAssemblyCount, setSubAssemblyCount] = useState(0);
   const [combinedProgress, setCombinedProgress] = useState(null);
   const [starting, setStarting] = useState(!jobInfo.sessionId);
-  const pollRef = useRef(null);
 
   const elapsed = useElapsed(session?.started_at||sessionStart);
   const pauseElapsed = useElapsed(pauseStart);
@@ -801,9 +877,20 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
       } catch(e){}
     };
     refresh();
-    pollRef.current = setInterval(refresh,5000);
-    return ()=>clearInterval(pollRef.current);
   },[sessionId, token]);
+  // SSE: live-refresh session data on production events
+  useSSE(['production'], () => {
+    if (sessionId) {
+      api(`/production/sessions/${sessionId}`,{},token).then(d => {
+        setSession(d);
+        setPallets(d.produced_quantity||0);
+        setStatus(d.status||'active');
+        if (d.status==='paused' && !pauseStart) setPauseStart(d.paused_at||new Date().toISOString());
+        if (d.status==='active') setPauseStart(null);
+        if (d.is_sub_assembly_mode) { setSubAssemblyMode(true); setSubAssemblyCount(d.sub_assembly_count||0); }
+      }).catch(()=>{});
+    }
+  }, token);
 
   // Combined progress
   useEffect(()=>{

@@ -128,6 +128,96 @@ const confirmAction = (message, { title = 'Confirm', confirmText = 'Confirm', ca
 };
 
 // ═══════════════════════════════════════════════════════════════
+// SSE (Server-Sent Events) — real-time push from server
+// ═══════════════════════════════════════════════════════════════
+
+// Global SSE connection manager — single connection shared by all components
+const SSEManager = (() => {
+  let eventSource = null;
+  let listeners = {};  // channel -> Set of callbacks
+  let currentToken = null;
+  let reconnectTimer = null;
+  let reconnectDelay = 1000;
+
+  function connect(token) {
+    if (eventSource && currentToken === token) return;  // already connected
+    disconnect();
+    currentToken = token;
+    if (!token) return;
+    const url = `${API_BASE}/events?token=${encodeURIComponent(token)}`;
+    eventSource = new EventSource(url);
+
+    eventSource.addEventListener('connected', () => {
+      reconnectDelay = 1000;  // reset backoff on success
+      console.log('[SSE] Connected');
+    });
+
+    eventSource.addEventListener('update', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        const channel = data.channel;
+        if (channel && listeners[channel]) {
+          listeners[channel].forEach(fn => {
+            try { fn(data); } catch(err) { console.error('[SSE] listener error:', err); }
+          });
+        }
+      } catch(err) { console.error('[SSE] parse error:', err); }
+    });
+
+    eventSource.onerror = () => {
+      console.warn('[SSE] Connection lost, reconnecting...');
+      eventSource.close();
+      eventSource = null;
+      reconnectTimer = setTimeout(() => {
+        reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+        connect(currentToken);
+      }, reconnectDelay);
+    };
+  }
+
+  function disconnect() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (eventSource) { eventSource.close(); eventSource = null; }
+    currentToken = null;
+  }
+
+  function subscribe(channel, callback) {
+    if (!listeners[channel]) listeners[channel] = new Set();
+    listeners[channel].add(callback);
+    return () => {
+      if (listeners[channel]) {
+        listeners[channel].delete(callback);
+        if (listeners[channel].size === 0) delete listeners[channel];
+      }
+    };
+  }
+
+  return { connect, disconnect, subscribe };
+})();
+
+/**
+ * useSSE hook — subscribe to one or more SSE channels.
+ * When the server pushes an event on any of the listed channels,
+ * the provided callback fires. Use this to trigger a data reload.
+ *
+ * Usage:
+ *   useSSE(['orders', 'docking'], () => loadData(), token);
+ */
+const useSSE = (channels, callback, token) => {
+  const cbRef = React.useRef(callback);
+  React.useEffect(() => { cbRef.current = callback; });
+
+  React.useEffect(() => {
+    if (!token) return;
+    SSEManager.connect(token);
+    const unsubs = channels.map(ch =>
+      SSEManager.subscribe(ch, () => cbRef.current())
+    );
+    return () => unsubs.forEach(fn => fn());
+  }, [token, channels.join(',')]);
+};
+
+// ═══════════════════════════════════════════════════════════════
 // STATUS HELPERS
 // ═══════════════════════════════════════════════════════════════
 const STATUS_LABELS = { T:'New/Tray', C:'Cut List', R:'Ready', P:'In Production', F:'Finished', dispatched:'Dispatched', delivered:'Delivered', collected:'Collected' };
@@ -522,11 +612,8 @@ const OpsDashboard = ({ token }) => {
 
   useEffect(() => { load(); }, [load]);
 
-  // Auto-refresh every 30 seconds
-  useEffect(() => {
-    const interval = setInterval(load, 30000);
-    return () => clearInterval(interval);
-  }, [load]);
+  // Real-time updates via SSE (replaces 30s polling)
+  useSSE(['orders', 'docking', 'dispatch'], load, token);
 
   if (loading) return (
     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '60vh' }}>
@@ -2833,11 +2920,8 @@ const DockingBoard = ({ token, reload: parentReload, dateFrom, dateTo }) => {
 
   useEffect(function() { loadBoard(); }, [loadBoard]);
 
-  // Auto-refresh every 30 seconds
-  useEffect(function() {
-    var t = setInterval(function() { loadBoard(); }, 30000);
-    return function() { clearInterval(t); };
-  }, [loadBoard]);
+  // Real-time updates via SSE (replaces 30s polling)
+  useSSE(['docking', 'orders'], loadBoard, token);
 
   // Send it: promote T->C (Issue Cut List -> Processing at Chainsaw)
   const handleSendIt = async (itemId) => {
@@ -3031,11 +3115,8 @@ const PlanningBoard = ({ token, user }) => {
   useEffect(() => { loadRef.current(); }, [dayOffset, activeTab, token, numDays]);
   const reload = () => { loadRef.current(); };
 
-  // Auto-refresh every 45 seconds
-  useEffect(() => {
-    const t = setInterval(() => { if (loadRef.current) loadRef.current(); }, 45000);
-    return () => clearInterval(t);
-  }, []);
+  // Real-time updates via SSE (replaces 45s polling)
+  useSSE(['schedule', 'orders', 'docking'], () => { if (loadRef.current) loadRef.current(); }, token);
 
   // Drop from intake queue → machine/day, or reschedule existing WO
   const handleDrop = async (dateStr, stationId, dragData) => {
@@ -3636,11 +3717,8 @@ const ProductionManager = ({ token }) => {
 
   useEffect(() => { loadRef.current(); }, [dateFilter, numDays, token]);
 
-  // Auto-refresh every 30 seconds
-  useEffect(() => {
-    const t = setInterval(() => { if (loadRef.current) loadRef.current(); }, 30000);
-    return () => clearInterval(t);
-  }, []);
+  // Real-time updates via SSE (replaces 30s polling)
+  useSSE(['schedule', 'orders', 'docking', 'production'], () => { if (loadRef.current) loadRef.current(); }, token);
 
   const reload = () => loadRef.current();
 
@@ -4058,12 +4136,9 @@ const ProductionFloorOverview = ({ token }) => {
     setLoading(false);
   }, [token]);
 
-  useEffect(() => {
-    load();
-    // Auto-refresh every 15 seconds for real-time visibility
-    intervalRef.current = setInterval(load, 15000);
-    return () => clearInterval(intervalRef.current);
-  }, [load]);
+  useEffect(() => { load(); }, [load]);
+  // Real-time updates via SSE (replaces 15s polling)
+  useSSE(['production', 'orders', 'schedule'], load, token);
 
   // Sort zones in the specified order: Viking, Handmade, DTL, Crates
   const sortedZones = [...data].sort((a, b) => {
@@ -4156,8 +4231,7 @@ const ProductionFloorOverview = ({ token }) => {
         </div>
       )}
 
-      {/* Auto-refresh indicator */}
-      <div style={{textAlign:'center',marginTop:12,fontSize:14,color:'#9ca3af'}}>Auto-refreshing every 15 seconds</div>
+      {/* SSE live updates — no polling needed */}
     </div>
   );
 };
@@ -4215,36 +4289,35 @@ const FloorTablet = ({ token, user }) => {
 
   useEffect(() => { loadFloorWorkers(); }, [loadFloorWorkers]);
 
-  // Auto-refresh production session
+  // Production session refresh
+  const refreshSession = useCallback(async () => {
+    if (!session) return;
+    try {
+      const sessions = await api(`/production/sessions?status=active`, {}, token);
+      const curr = sessions.find(s=>s.id===session.id);
+      if (curr) {
+        setQty(curr.produced_quantity||0);
+        setPaused(false);
+        setSubAssemblyMode(!!curr.is_sub_assembly_mode);
+        setSubAssemblyCount(curr.sub_assembly_count||0);
+        if (curr.workers) setWorkers(curr.workers);
+      } else {
+        const pausedSessions = await api(`/production/sessions?status=paused`, {}, token);
+        const p = pausedSessions.find(s=>s.id===session.id);
+        if (p) { setQty(p.produced_quantity||0); setPaused(true); if(p.workers) setWorkers(p.workers); }
+      }
+      if (session.item?.id) {
+        const sp = await api(`/production/shared-progress/${session.item.id}`, {}, token).catch(()=>null);
+        if (sp) setSharedProgress(sp);
+      }
+    } catch(e) {}
+  }, [session, token]);
+
   useEffect(() => {
-    if (view === 'production' && session) {
-      const refresh = async () => {
-        try {
-          const sessions = await api(`/production/sessions?status=active`, {}, token);
-          const curr = sessions.find(s=>s.id===session.id);
-          if (curr) {
-            setQty(curr.produced_quantity||0);
-            setPaused(false);
-            setSubAssemblyMode(!!curr.is_sub_assembly_mode);
-            setSubAssemblyCount(curr.sub_assembly_count||0);
-            if (curr.workers) setWorkers(curr.workers);
-          } else {
-            const pausedSessions = await api(`/production/sessions?status=paused`, {}, token);
-            const p = pausedSessions.find(s=>s.id===session.id);
-            if (p) { setQty(p.produced_quantity||0); setPaused(true); if(p.workers) setWorkers(p.workers); }
-          }
-          // Shared WO progress
-          if (session.item?.id) {
-            const sp = await api(`/production/shared-progress/${session.item.id}`, {}, token).catch(()=>null);
-            if (sp) setSharedProgress(sp);
-          }
-        } catch(e) {}
-      };
-      refresh();
-      intervalRef.current = setInterval(refresh, 15000);
-    }
-    return () => clearInterval(intervalRef.current);
+    if (view === 'production' && session) refreshSession();
   }, [view, session, token]);
+  // Real-time updates for active session via SSE (replaces 15s polling)
+  useSSE(['production'], refreshSession, token);
 
   const startSession = async (order) => {
     try {
@@ -4783,8 +4856,8 @@ const QADashboard = ({ token }) => {
   }, [token]);
 
   useEffect(() => { load(); }, [load]);
-  // Auto-refresh QA every 30 seconds
-  useEffect(() => { const iv = setInterval(() => load(), 30000); return () => clearInterval(iv); }, [load]);
+  // SSE: live-refresh QA on relevant events
+  useSSE(['qa', 'orders', 'production'], load, token);
 
   const addDefect = async () => {
     if (!inspecting) return;
@@ -5758,8 +5831,8 @@ const DispatchDashboard = ({ token }) => {
   };
 
   useEffect(() => { loadRef.current(); }, [dayOffset, numDays, activeTruck, token, subPage]);
-  // Auto-refresh dispatch every 30 seconds
-  useEffect(() => { const iv = setInterval(() => { if (loadRef.current) loadRef.current(); }, 30000); return () => clearInterval(iv); }, []);
+  // SSE: live-refresh dispatch on relevant events
+  useSSE(['dispatch', 'orders'], () => { if (loadRef.current) loadRef.current(); }, token);
   const reload = () => loadRef.current();
 
   // Assign truck to a delivery_log entry
@@ -10448,9 +10521,9 @@ const ChainsawDockingWorkView = ({ token, user }) => {
 
   useEffect(() => {
     loadJobs();
-    const timer = setInterval(loadJobs, 30000);
-    return () => clearInterval(timer);
   }, [token]);
+  // SSE: live-refresh chainsaw jobs on docking events
+  useSSE(['docking', 'orders'], loadJobs, token);
 
   const completeDocking = async (job) => {
     if (completing[job.id]) return;
