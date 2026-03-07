@@ -366,7 +366,7 @@ const PinLogin = ({ onLogin }) => {
 // ═══════════════════════════════════════════════════════════════
 // SAFETY CHECKLIST — fetches dynamic items from API
 // ═══════════════════════════════════════════════════════════════
-const SafetyChecklist = ({ onConfirm, driverName, token }) => {
+const SafetyChecklist = ({ onConfirm, driverName }) => {
   const [items, setItems] = useState([]);
   const [checks, setChecks] = useState({});
   const [loadingItems, setLoadingItems] = useState(true);
@@ -374,7 +374,7 @@ const SafetyChecklist = ({ onConfirm, driverName, token }) => {
   useEffect(() => {
     const fetchItems = async () => {
       try {
-        const data = await api("/driver/safety-checklist-items", {}, token);
+        const data = await api("/driver/safety-checklist-items");
         if (data && data.length > 0) {
           setItems(data);
         } else {
@@ -402,8 +402,8 @@ const SafetyChecklist = ({ onConfirm, driverName, token }) => {
         setLoadingItems(false);
       }
     };
-    if (token) fetchItems();
-  }, [token]);
+    fetchItems();
+  }, []);
 
   const allChecked = items.length > 0 && items.every(item => checks[item.id]);
 
@@ -3379,7 +3379,7 @@ const App = () => {
     case "truck":
       return <TruckSelect trucks={trucks} defaultTruck={defaultTruck} onSelect={handleTruckSelected} loading={clockLoading} />;
     case "safety":
-      return <SafetyChecklist onConfirm={handleSafetyConfirm} driverName={user?.full_name || "Driver"} token={token} />;
+      return <SafetyChecklist onConfirm={handleSafetyConfirm} driverName={user?.full_name || "Driver"} />;
     case "app":
       return <DriverApp user={user} token={token} shift={shift} onClockOff={handleClockOff} />;
     default:
