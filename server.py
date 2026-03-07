@@ -3784,8 +3784,9 @@ def dispatch(method, path, params, body, conn):
             )
         """
 
-        # Docking Required: status='T', has schedule entry (scheduled but not yet cut-listed)
-        q1 = base_q + " WHERE oi.status='T' AND se.id IS NOT NULL"
+        # Column 1 - Docking Required: items promoted to C that need docking work
+        # Items at status T stay on the Planning Board ONLY — they flow here after T→C
+        q1 = base_q + " WHERE oi.status='C'"
         if zone_filter:
             q1 += " AND oi.zone_id=?"
             params_q1 = [int(zone_filter)]
@@ -3794,30 +3795,31 @@ def dispatch(method, path, params, body, conn):
         q1 += " ORDER BY sched_date ASC, o.order_number"
         docking_required = rows_to_list(conn.execute(q1, params_q1).fetchall())
 
-        # Cut List Issued: status='C', cut_list_issued=1
-        q2 = base_q + " WHERE oi.status='C' AND oi.cut_list_issued=1"
+        # Column 2 - Docking Complete: status='R' (recently completed, ready for production)
+        q2 = base_q + " WHERE oi.status='R'"
         if zone_filter:
             q2 += " AND oi.zone_id=?"
             params_q2 = [int(zone_filter)]
         else:
             params_q2 = []
-        q2 += " ORDER BY sched_date ASC, o.order_number"
-        cut_list_issued = rows_to_list(conn.execute(q2, params_q2).fetchall())
+        q2 += " ORDER BY COALESCE(oi.docking_completed_at, oi.updated_at, oi.created_at) DESC LIMIT 50"
+        docking_complete = rows_to_list(conn.execute(q2, params_q2).fetchall())
 
-        # Docking Complete: status='R' (recently completed)
-        q3 = base_q + " WHERE oi.status='R'"
+        # Column 3 - In Production: status='P' (already in production, for reference)
+        q3 = base_q + " WHERE oi.status='P'"
         if zone_filter:
             q3 += " AND oi.zone_id=?"
             params_q3 = [int(zone_filter)]
         else:
             params_q3 = []
-        q3 += " ORDER BY COALESCE(oi.docking_completed_at, oi.updated_at, oi.created_at) DESC LIMIT 50"
-        docking_complete = rows_to_list(conn.execute(q3, params_q3).fetchall())
+        q3 += " ORDER BY oi.updated_at DESC LIMIT 50"
+        in_production = rows_to_list(conn.execute(q3, params_q3).fetchall())
 
         return {"status": 200, "body": {
             "docking_required": docking_required,
-            "cut_list_issued": cut_list_issued,
-            "docking_complete": docking_complete
+            "cut_list_issued": docking_required,  # Same as col 1 for backward compat
+            "docking_complete": docking_complete,
+            "in_production": in_production
         }}
 
     # ----- DELIVERY TYPE TOGGLE -----

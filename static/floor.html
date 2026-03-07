@@ -10,9 +10,9 @@
   <link rel="manifest" href="/manifest-floor.json" />
   <meta name="theme-color" content="#07324C" />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Barlow+Condensed:wght@600;700;800;900&display=swap" rel="stylesheet" />
-  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" integrity="sha384-tMH8h3BGESGckSAVGZ82T9n90ztNXxvdwvdM6UoR56cYcf+0iGXBliJ29D+wZ/x8" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" integrity="sha384-bm7MnzvK++ykSwVJ2tynSE5TRdN+xL418osEVF2DE/L/gfWHj91J2Sphe582B1Bh" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js" integrity="sha384-AISI5AuDG6E8DeEiFMVB3rGQxhZt24OU0avMp+GMV64+tpnA3+Z6F5MT0f96iPva" crossorigin="anonymous"></script>
   <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html { font-size: 18px; }
@@ -149,7 +149,8 @@ const api = async (path, options = {}, token = null) => {
   if (token) headers['Authorization'] = `Bearer ${token}`;
   const res = await fetch(API_BASE + path, { ...options, headers });
   const text = await res.text();
-  let data; try { data = JSON.parse(text); } catch { data = { error: text }; }
+  let data; try { data = JSON.parse(text); } catch(e) { data = { error: text }; }
+  if (res.status === 401) { if (token) { localStorage.removeItem('hyne_floor_session'); toast('Session expired — please log in again','error'); setTimeout(() => window.location.reload(), 1500); } throw new Error('Authentication required'); }
   if (!res.ok) throw new Error(data.error || data.message || `HTTP ${res.status}`);
   return data;
 };
@@ -248,7 +249,7 @@ const PinLogin = ({ onLogin }) => {
       } else {
         setError('Invalid PIN'); setPin('');
       }
-    } catch { setError('Invalid PIN — try again'); setPin(''); }
+    } catch(e) { setError('Invalid PIN — try again'); setPin(''); }
     setLoading(false);
   };
 
@@ -410,7 +411,7 @@ const SkuSearch = ({ token, zoneId, onSelect, placeholder }) => {
         const d = await api(`/skus/search?q=${encodeURIComponent(q)}${zoneId?`&zone_id=${zoneId}`:''}`,{},token);
         setResults(Array.isArray(d)?d:[]);
         setOpen(true);
-      } catch { setResults([]); }
+      } catch(e) { setResults([]); }
     },300);
   },[q]);
 
@@ -442,7 +443,7 @@ const SkuSearch = ({ token, zoneId, onSelect, placeholder }) => {
 // ═══════════════════════════════════════════════════════════════
 // 3. HOME / JOB SELECTION SCREEN
 // ═══════════════════════════════════════════════════════════════
-const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onStartSetup, onLogout }) => {
+const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onStartSetup, onChangeStation, onLogout }) => {
   const [tab, setTab] = useState('job');
   const [stationData, setStationData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -466,7 +467,7 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
 
   useEffect(()=>{
     loadData();
-    pollRef.current = setInterval(loadData, 15000);
+    pollRef.current = setInterval(loadData, 5000);
     return ()=>clearInterval(pollRef.current);
   },[loadData]);
 
@@ -476,7 +477,7 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
       const params = skuId?`sku_id=${skuId}`:orderItemId?`order_item_id=${orderItemId}`:'';
       const d = await api(`/production/drawings?${params}`,{},token);
       setDrawings(Array.isArray(d)?d:[]);
-    } catch { setDrawings([]); }
+    } catch(e) { setDrawings([]); }
     finally { setDrawingsLoading(false); }
   };
 
@@ -488,10 +489,11 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
       <Topbar user={user} zone={zone} station={station} sessionStart={sessionStart} onLogout={onLogout} />
 
       {/* Session info strip */}
-      <div style={{background:'#07324C',borderTop:'1px solid rgba(255,255,255,0.1)',padding:'8px 16px',display:'flex',gap:'16px',flexWrap:'wrap',fontSize:'15px',color:'rgba(255,255,255,0.75)'}}>
+      <div style={{background:'#07324C',borderTop:'1px solid rgba(255,255,255,0.1)',padding:'8px 16px',display:'flex',gap:'16px',flexWrap:'wrap',fontSize:'15px',color:'rgba(255,255,255,0.75)',alignItems:'center'}}>
         <span><strong style={{color:'white'}}>Zone:</strong> {zone?.name}</span>
         <span><strong style={{color:'white'}}>Station:</strong> {station?.name}</span>
         <span><strong style={{color:'white'}}>Worker:</strong> {user?.name||user?.username||'Floor Worker'}</span>
+        <button onClick={onChangeStation} style={{marginLeft:'auto',background:'rgba(255,255,255,0.15)',border:'none',color:'white',padding:'4px 12px',borderRadius:8,fontWeight:700,fontSize:14,cursor:'pointer'}}>Change Station</button>
       </div>
 
       {/* Tab bar */}
@@ -615,31 +617,7 @@ const HomeScreen = ({ token, user, zone, station, sessionStart, onStartJob, onSt
               </button>
             </div>
 
-            {/* Setup / Jig Timer */}
-            <div className="section-lbl">Setup / Jig Timer</div>
-            <div style={{background:'white',borderRadius:'16px',padding:'20px',boxShadow:'0 2px 8px rgba(0,0,0,.07)'}}>
-              {workOrders.length > 0 && (
-                <div style={{marginBottom:'12px'}}>
-                  <div style={{fontSize:'16px',fontWeight:600,color:'#374151',marginBottom:'6px'}}>Link to Work Order (optional)</div>
-                  <select className="sku-input" value={setupWo||''} onChange={e=>{const v=e.target.value;setSetupWo(v?workOrders.find(w=>(w.id||w.order_item_id)==Number(v)):null);}} style={{width:'100%'}}>
-                    <option value="">— No WO linked —</option>
-                    {workOrders.map(wo=><option key={wo.id||wo.order_item_id} value={wo.id||wo.order_item_id}>WO# {wo.order_number} — {wo.sku_code}</option>)}
-                  </select>
-                </div>
-              )}
-              <div style={{marginBottom:'12px'}}>
-                <div style={{fontSize:'16px',fontWeight:600,color:'#374151',marginBottom:'6px'}}>Description (optional)</div>
-                <input className="sku-input" value={setupDesc} onChange={e=>setSetupDesc(e.target.value)} placeholder="e.g. Jig setup for Viking 800" style={{width:'100%'}} />
-              </div>
-              <div style={{marginBottom:'16px'}}>
-                <div style={{fontSize:'16px',fontWeight:600,color:'#374151',marginBottom:'6px'}}>Link to SKU (optional)</div>
-                <SkuSearch token={token} zoneId={zone?.id} onSelect={setSetupSku} placeholder="Optional — link to SKU" />
-              </div>
-              <button className="action-btn" onClick={()=>onStartSetup({desc:setupDesc,sku:setupSku,wo:setupWo})}
-                style={{width:'100%',background:'#F59E0B',fontSize:'20px'}}>
-                ⏱ START SETUP TIMER
-              </button>
-            </div>
+
           </div>
         )}
 
@@ -823,7 +801,7 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
       } catch(e){}
     };
     refresh();
-    pollRef.current = setInterval(refresh,15000);
+    pollRef.current = setInterval(refresh,5000);
     return ()=>clearInterval(pollRef.current);
   },[sessionId, token]);
 
@@ -841,13 +819,16 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
     }
   },[pallets]);
 
+  const loggingRef = React.useRef(false);
   const logQuantity = async(delta)=>{
-    if (!sessionId) return;
+    if (!sessionId || loggingRef.current) return;
+    loggingRef.current = true;
     const newCount = Math.max(0, pallets+delta);
     setPallets(newCount);
     try {
       await api(`/production/sessions/${sessionId}/log`,{method:'PUT',body:JSON.stringify({quantity_change:delta})},token);
-    } catch(e){ setPallets(pallets); toast('Failed to log quantity','error'); }
+    } catch(e){ setPallets(prev => Math.max(0, prev - delta)); toast('Failed to log quantity','error'); }
+    finally { loggingRef.current = false; }
   };
 
   const toggleSubAssembly = async()=>{
@@ -866,13 +847,13 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
     setSubAssemblyCount(newCount);
     try {
       await api(`/production/sessions/${sessionId}/sub-assembly-log`,{method:'PUT',body:JSON.stringify({quantity_change:delta})},token);
-    } catch(e){ setSubAssemblyCount(subAssemblyCount); toast('Failed to log sub-assembly','error'); }
+    } catch(e){ setSubAssemblyCount(prev => Math.max(0, prev - delta)); toast('Failed to log sub-assembly','error'); }
   };
 
   const target = session?.target_quantity||jobInfo.wo?.quantity||jobInfo.qty||0;
-  const pct = target>0 ? Math.min(100, Math.round((pallets/target)*100)) : 0;
-  const barColor = pct>=100 ? '#DC2626' : pct>=80 ? '#F59E0B' : '#059669';
-  const trackStatus = pct>=100 ? 'over' : pct>=80 ? 'close' : 'on_track';
+  const pct = target>0 ? Math.round((pallets/target)*100) : 0;
+  const barColor = pct>100 ? '#DC2626' : pct>=100 ? '#059669' : pct>=80 ? '#F59E0B' : '#059669';
+  const trackStatus = pct>100 ? 'over' : pct>=100 ? 'complete' : pct>=80 ? 'close' : 'on_track';
 
   const wo = jobInfo.wo||{};
   const sku = jobInfo.sku||{};
@@ -913,7 +894,7 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
             <button onClick={async()=>{
               try {
                 await api('/production/qa-check',{method:'POST',body:JSON.stringify({session_id:sessionId,pallet_count:pallets,passed:1})},token);
-              } catch(e){}
+              } catch(e){ toast('QA check failed to record — please try again','error'); return; }
               setQaAlert(false);
             }}
               style={{background:'white',color:'#92400E',border:'none',borderRadius:'10px',padding:'10px 16px',fontSize:'17px',fontWeight:800,minHeight:'44px'}}>
@@ -959,12 +940,12 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
               <div style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'22px',fontWeight:700,color:'#374151'}}>
                 Target Progress — {pct}%
               </div>
-              <span className={`badge ${trackStatus==='on_track'?'badge-green':trackStatus==='close'?'badge-amber':'badge-red'}`}>
-                {trackStatus==='on_track'?'On Track':trackStatus==='close'?'Close to Limit':'Over Allocated'}
+              <span className={`badge ${trackStatus==='over'?'badge-red':trackStatus==='complete'?'badge-green':trackStatus==='close'?'badge-amber':'badge-green'}`}>
+                {trackStatus==='over'?'Over Allocated':trackStatus==='complete'?'Complete':trackStatus==='close'?'Close to Limit':'On Track'}
               </span>
             </div>
             <div className="progress-bar-track">
-              <div className="progress-bar-fill" style={{width:`${pct}%`,background:barColor}} />
+              <div className="progress-bar-fill" style={{width:`${Math.min(pct,100)}%`,background:barColor}} />
             </div>
             <div style={{display:'flex',justifyContent:'space-between',marginTop:'8px',fontSize:'17px',color:'#6B7280'}}>
               <span>{pallets} made</span>
@@ -1045,7 +1026,7 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
             style={{background:'#3B82F6',flexDirection:'column',gap:'4px',padding:'18px 8px',fontSize:'17px'}}>
             🔄 SWITCH SKU
           </button>
-          <button className="action-btn" onClick={()=>onComplete(sessionId)}
+          <button className="action-btn" onClick={()=>onComplete(sessionId, pallets)}
             style={{background:'#059669',flexDirection:'column',gap:'4px',padding:'18px 8px',fontSize:'17px'}}>
             ✓ COMPLETE
           </button>
@@ -1378,6 +1359,88 @@ const ShiftChangeover = ({ token, zone, station, onComplete }) => {
 };
 
 // ═══════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// JIG CHECK SCREEN — prompt before production: Jig Setup Needed? or Continue
+// ═══════════════════════════════════════════════════════════════
+const JigCheckScreen = ({ user, zone, station, jobInfo, onContinueWithJob, onJigSetup, onLogout }) => {
+  const [jigConfirmed, setJigConfirmed] = useState(false);
+  const woName = jobInfo?.wo?.product_name || jobInfo?.wo?.sku_code || 'Job';
+  const woNumber = jobInfo?.wo?.order_number || '';
+
+  // If user chose "Continue with Job" — show jig QA sign-off
+  if (jigConfirmed === 'qa') {
+    return (
+      <div style={{minHeight:'100vh',display:'flex',flexDirection:'column',background:'#F0F2F5'}}>
+        <div style={{background:'#07324C',color:'white',padding:'16px 20px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+          <div style={{fontFamily:'Barlow Condensed,sans-serif',fontWeight:800,fontSize:'22px'}}>Jig QA Confirmation</div>
+          <button onClick={onLogout} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',padding:'8px 16px',borderRadius:10,fontWeight:700,fontSize:16,cursor:'pointer'}}>Logout</button>
+        </div>
+        <div style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',padding:'20px'}}>
+          <div style={{background:'white',borderRadius:20,padding:'32px 28px',maxWidth:440,width:'100%',boxShadow:'0 4px 20px rgba(0,0,0,0.1)',textAlign:'center'}}>
+            <div style={{fontSize:'48px',marginBottom:'16px'}}>\u2705</div>
+            <h2 style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'28px',fontWeight:800,color:'#07324C',marginBottom:'8px'}}>Jig QA Sign-Off</h2>
+            <div style={{fontSize:'18px',color:'#6B7280',marginBottom:'24px'}}>
+              <strong>{woNumber}</strong> \u2014 {woName}
+            </div>
+            <div style={{background:'#FEF3C7',border:'2px solid #F59E0B',borderRadius:12,padding:'16px',marginBottom:'24px',textAlign:'left'}}>
+              <div style={{fontWeight:800,color:'#92400E',fontSize:'16px',marginBottom:'6px'}}>\u26A0 Jig Verification Required</div>
+              <div style={{color:'#78350F',fontSize:'15px'}}>By confirming below, you certify that the current jig setup is correct and to spec for this production run.</div>
+            </div>
+            <label style={{display:'flex',alignItems:'center',gap:'12px',cursor:'pointer',background:'#F8FAFC',padding:'14px 16px',borderRadius:12,border:'2px solid #E2E8F0',marginBottom:'20px'}}>
+              <input type="checkbox" checked={jigConfirmed === 'confirmed'} onChange={e => setJigConfirmed(e.target.checked ? 'confirmed' : 'qa')} style={{width:24,height:24,accentColor:'#07324C'}} />
+              <span style={{fontSize:'17px',fontWeight:700,color:'#07324C'}}>I confirm the jig is to spec</span>
+            </label>
+            <button
+              disabled={jigConfirmed !== 'confirmed'}
+              onClick={onContinueWithJob}
+              style={{
+                width:'100%',padding:'16px',borderRadius:12,border:'none',fontSize:'20px',
+                fontFamily:'Barlow Condensed,sans-serif',fontWeight:800,cursor:jigConfirmed==='confirmed'?'pointer':'not-allowed',
+                background:jigConfirmed==='confirmed'?'#059669':'#D1D5DB',
+                color:jigConfirmed==='confirmed'?'white':'#9CA3AF'
+              }}
+            >
+              \u25B6 COMMENCE PRODUCTION
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Main jig check prompt
+  return (
+    <div style={{minHeight:'100vh',display:'flex',flexDirection:'column',background:'#F0F2F5'}}>
+      <div style={{background:'#07324C',color:'white',padding:'16px 20px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+        <div style={{fontFamily:'Barlow Condensed,sans-serif',fontWeight:800,fontSize:'22px'}}>Job Setup</div>
+        <button onClick={onLogout} style={{background:'rgba(255,255,255,0.15)',border:'none',color:'white',padding:'8px 16px',borderRadius:10,fontWeight:700,fontSize:16,cursor:'pointer'}}>Logout</button>
+      </div>
+      <div style={{flex:1,display:'flex',alignItems:'center',justifyContent:'center',padding:'20px'}}>
+        <div style={{background:'white',borderRadius:20,padding:'32px 28px',maxWidth:440,width:'100%',boxShadow:'0 4px 20px rgba(0,0,0,0.1)',textAlign:'center'}}>
+          <div style={{fontSize:'48px',marginBottom:'16px'}}>\uD83D\uDD27</div>
+          <h2 style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'28px',fontWeight:800,color:'#07324C',marginBottom:'8px'}}>{woNumber}</h2>
+          <div style={{fontSize:'18px',color:'#6B7280',marginBottom:'32px'}}>{woName}</div>
+
+          <button
+            onClick={onJigSetup}
+            style={{width:'100%',padding:'18px',borderRadius:12,border:'none',fontSize:'20px',fontFamily:'Barlow Condensed,sans-serif',fontWeight:800,cursor:'pointer',background:'#F59E0B',color:'white',marginBottom:'16px'}}
+          >
+            \uD83D\uDD27 JIG SETUP NEEDED
+          </button>
+
+          <button
+            onClick={() => setJigConfirmed('qa')}
+            style={{width:'100%',padding:'18px',borderRadius:12,border:'none',fontSize:'20px',fontFamily:'Barlow Condensed,sans-serif',fontWeight:800,cursor:'pointer',background:'#059669',color:'white'}}
+          >
+            \u25B6 CONTINUE WITH JOB
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ═══════════════════════════════════════════════════════════════
 // MAIN APP
 // ═══════════════════════════════════════════════════════════════
 const App = () => {
@@ -1417,7 +1480,7 @@ const App = () => {
             setScreen('zone_select');
           }
         } else { setScreen('login'); }
-      } catch { setScreen('login'); }
+      } catch(e) { setScreen('login'); }
     }
   },[]);
 
@@ -1439,7 +1502,7 @@ const App = () => {
     setJobInfo(info);
     setActiveSessionId(null);
     setSessionStatus('active');
-    setScreen('active_job');
+    setScreen('jig_check'); // New: go to jig check before production
   };
 
   const handleStartSetup = (info) => {
@@ -1452,9 +1515,9 @@ const App = () => {
     setShowPauseModal(true);
   };
 
-  const handleComplete = async(sid) => {
+  const handleComplete = async(sid, producedQty) => {
     try {
-      await api(`/production/sessions/${sid}/complete`,{method:'PUT',body:JSON.stringify({})},token);
+      await api(`/production/sessions/${sid}/complete`,{method:'PUT',body:JSON.stringify({ produced_quantity: producedQty ?? undefined })},token);
       setCompletedSessionId(sid);
       setScreen('summary');
     } catch(e){
@@ -1488,6 +1551,7 @@ const App = () => {
         sessionStart={sessionStart}
         onStartJob={handleStartJob}
         onStartSetup={handleStartSetup}
+        onChangeStation={()=>setScreen('zone_select')}
         onLogout={handleLogout}
       />
     ),
@@ -1496,7 +1560,7 @@ const App = () => {
         token={token} user={user} zone={zone} station={station}
         sessionStart={sessionStart} setupInfo={jobInfo||{}}
         onFinishSetup={()=>setScreen('home')}
-        onStartJobFromSetup={(sid)=>{ setJobInfo({...jobInfo,sessionId:sid}); setScreen('active_job'); }}
+        onStartJobFromSetup={()=>{ setJobInfo({...jobInfo,sessionId:null}); setScreen('active_job'); }}
         onLogout={handleLogout}
       />
     ),
@@ -1529,6 +1593,14 @@ const App = () => {
         onNextJob={()=>setScreen('home')}
         onManualJob={()=>{ setJobInfo({type:'manual'}); setScreen('home'); }}
         onEndShift={()=>setScreen('changeover')}
+        onLogout={handleLogout}
+      />
+    ),
+    jig_check: (
+      <JigCheckScreen
+        user={user} zone={zone} station={station} jobInfo={jobInfo||{}}
+        onContinueWithJob={()=>setScreen('active_job')}
+        onJigSetup={()=>setScreen('setup')}
         onLogout={handleLogout}
       />
     ),
