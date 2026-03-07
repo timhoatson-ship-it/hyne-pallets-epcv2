@@ -3733,48 +3733,56 @@ const ProductionManager = ({ token }) => {
     } catch (e) { toast(e.message, 'error'); }
   };
 
-  const moveStatus = async (entryId, status) => {
+  // Start Production: creates production session → backend promotes order_item R→P
+  const startProduction = async (entry) => {
     try {
-      // Find the schedule entry to get order_item_id, station_id, zone_id
-      const entry = schedule.find(s => s.id === entryId);
+      if (!entry.order_item_id || !entry.station_id) {
+        toast('Cannot start: missing order item or station', 'error'); return;
+      }
+      await api('/production/sessions', {
+        method: 'POST',
+        body: JSON.stringify({
+          order_item_id: entry.order_item_id,
+          station_id: entry.station_id,
+          zone_id: entry.zone_id,
+          target_quantity: entry.planned_quantity || entry.item_quantity || 0
+        })
+      }, token);
+      toast('Production started', 'success');
+      reload();
+    } catch (e) { toast(e.message, 'error'); }
+  };
 
-      if (status === 'in_progress' && entry && entry.order_item_id && entry.station_id) {
-        // Create a production session — this promotes the order_item R→P on the backend
-        await api('/production/sessions', {
-          method: 'POST',
-          body: JSON.stringify({
-            order_item_id: entry.order_item_id,
-            station_id: entry.station_id,
-            zone_id: entry.zone_id,
-            target_quantity: entry.planned_quantity || entry.item_quantity || 0
-          })
+  // Complete Production: completes active session → backend triggers QA gate → P→F
+  const completeProduction = async (entry) => {
+    try {
+      if (!entry.order_item_id) {
+        toast('Cannot complete: missing order item', 'error'); return;
+      }
+      // Find active/paused production session for this order_item
+      const sessions = await api('/production/sessions?status=active', {}, token);
+      let activeSession = (sessions || []).find(s => s.order_item_id === entry.order_item_id);
+      if (!activeSession) {
+        // Also check paused sessions
+        const pausedSessions = await api('/production/sessions?status=paused', {}, token);
+        activeSession = (pausedSessions || []).find(s => s.order_item_id === entry.order_item_id);
+      }
+      if (activeSession) {
+        const finalQty = (activeSession.produced_quantity && activeSession.produced_quantity > 0)
+          ? activeSession.produced_quantity
+          : (entry.planned_quantity || entry.item_quantity || 0);
+        await api(`/production/sessions/${activeSession.id}/complete`, {
+          method: 'PUT',
+          body: JSON.stringify({ produced_quantity: finalQty, force_complete: true })
+        }, token);
+      } else {
+        // No session exists — advance item status directly via pipeline
+        await api(`/order-items/${entry.order_item_id}/status`, {
+          method: 'PUT',
+          body: JSON.stringify({ status: 'F' })
         }, token);
       }
-
-      if (status === 'completed' && entry && entry.order_item_id) {
-        // Find active production session for this order_item and complete it
-        try {
-          const sessions = await api('/production/sessions?status=active', {}, token);
-          const activeSession = (sessions || []).find(s => s.order_item_id === entry.order_item_id);
-          if (activeSession) {
-            // If no production was logged via Worker Console, assume full planned quantity completed
-            const finalQty = (activeSession.produced_quantity && activeSession.produced_quantity > 0)
-              ? activeSession.produced_quantity
-              : (entry.planned_quantity || entry.item_quantity || 0);
-            await api(`/production/sessions/${activeSession.id}/complete`, {
-              method: 'PUT',
-              body: JSON.stringify({ produced_quantity: finalQty, force_complete: true })
-            }, token);
-          }
-        } catch (compErr) { console.warn('Could not complete production session:', compErr); }
-      }
-
-      // Update the schedule entry status
-      await api(`/schedule/${entryId}`, {
-        method: 'PUT',
-        body: JSON.stringify({ status })
-      }, token);
-      toast(`Status → ${status}`, 'success');
+      toast('Production completed', 'success');
       reload();
     } catch (e) { toast(e.message, 'error'); }
   };
@@ -3937,13 +3945,11 @@ const ProductionManager = ({ token }) => {
                               <div style={{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:3}}>
                                 <span style={{
                                   fontSize:15,fontWeight:700,padding:'2px 6px',borderRadius:8,
-                                  background: entry.status==='in_progress' ? '#dbeafe' : entry.status==='completed' ? '#dcfce7' : entry.status==='partial_complete' ? '#fef3c7' : '#f3f4f6',
-                                  color: entry.status==='in_progress' ? '#1d4ed8' : entry.status==='completed' ? '#166534' : entry.status==='partial_complete' ? '#92400e' : '#6b7280'
-                                }}>{entry.status==='partial_complete'?'Partial Complete':entry.status||'planned'}</span>
-                                {isDockingOrder && cutListDone && <span style={{background:'#fef3c7',color:'#92400e',padding:'2px 8px',borderRadius:6,fontSize:12,fontWeight:600}}>🔶 DOCKING</span>}
-                                {isDockingOrder && !cutListDone && <span style={{background:'#f3f4f6',color:'#6b7280',padding:'2px 8px',borderRadius:6,fontSize:12,fontWeight:600}}>⬜ SCHEDULED</span>}
-                                {isReadyOrder && <span style={{fontSize:15,fontWeight:700,padding:'2px 6px',borderRadius:8,background:'#dcfce7',color:'#166534'}}>✅ READY</span>}
-                                {isInProd && <span style={{fontSize:15,fontWeight:700,padding:'2px 6px',borderRadius:8,background:'#ede9fe',color:'#6d28d9'}}>🔧 IN PROD</span>}
+                                  background: itemStatus==='T' ? '#e5e7eb' : itemStatus==='C' ? '#dbeafe' : itemStatus==='R' ? '#fef3c7' : itemStatus==='P' ? '#fed7aa' : itemStatus==='F' ? '#dcfce7' : '#f3f4f6',
+                                  color: itemStatus==='T' ? '#6b7280' : itemStatus==='C' ? '#1d4ed8' : itemStatus==='R' ? '#92400e' : itemStatus==='P' ? '#9a3412' : itemStatus==='F' ? '#166534' : '#6b7280'
+                                }}>{STATUS_LABELS[itemStatus] || itemStatus || 'Unknown'}</span>
+                                {isDockingOrder && cutListDone && <span style={{background:'#fef3c7',color:'#92400e',padding:'2px 8px',borderRadius:6,fontSize:12,fontWeight:600}}>{"\uD83D\uDD36"} DOCKING</span>}
+                                {isDockingOrder && !cutListDone && <span style={{background:'#f3f4f6',color:'#6b7280',padding:'2px 8px',borderRadius:6,fontSize:12,fontWeight:600}}>{"\u2B1C"} SCHEDULED</span>}
                               </div>
                             </div>
                             <div className="flex gap-1 mt-2" style={{flexWrap:'wrap'}}>
@@ -3959,27 +3965,16 @@ const ProductionManager = ({ token }) => {
                                   <option key={st.id} value={st.id}>{st.name}</option>
                                 ))}
                               </select>
-                              {entry.status === 'planned' && (
+                              {itemStatus === 'R' && (
                                 <button style={{fontSize:15,padding:'2px 6px',background:'#dbeafe',color:'#1d4ed8',borderRadius:4,cursor:'pointer',border:'none'}}
-                                  onClick={()=>moveStatus(entry.id,'in_progress')}>Start</button>
+                                  onClick={()=>startProduction(entry)}>Start</button>
                               )}
-                              {entry.status === 'in_progress' && (
+                              {itemStatus === 'P' && (
                                 <button style={{fontSize:15,padding:'2px 6px',background:'#dcfce7',color:'#166534',borderRadius:4,cursor:'pointer',border:'none'}}
-                                  onClick={()=>moveStatus(entry.id,'completed')}>Complete</button>
+                                  onClick={()=>completeProduction(entry)}>Complete</button>
                               )}
-                              {entry.status === 'partial_complete' && (
-                                <>
-                                  <button style={{fontSize:13,padding:'2px 6px',background:'#fee2e2',color:'#991b1b',borderRadius:4,cursor:'pointer',border:'none'}}
-                                    onClick={()=>moveStatus(entry.id,'completed')}>Close Remaining</button>
-                                  <button style={{fontSize:13,padding:'2px 6px',background:'#dbeafe',color:'#1d4ed8',borderRadius:4,cursor:'pointer',border:'none'}}
-                                    onClick={async()=>{
-                                      try {
-                                        await api(`/schedule/${entry.id}/replan`, {method:'POST',body:JSON.stringify({})}, token);
-                                        toast('Remaining qty re-planned','success');
-                                        reload();
-                                      } catch(err){toast(err.message,'error');}
-                                    }}>Re-plan Remaining</button>
-                                </>
+                              {itemStatus === 'F' && (
+                                <span style={{fontSize:13,padding:'2px 8px',background:'#dcfce7',color:'#166534',borderRadius:4,fontWeight:600}}>{"\u2705"} Finished</span>
                               )}
                             </div>
                             {/* Stage advance dropdown for planners */}
