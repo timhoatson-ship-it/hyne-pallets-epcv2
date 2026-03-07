@@ -2689,6 +2689,14 @@ def migrate_db():
     """)
     conn.commit()
 
+    # Add delivery_group_id column to delivery_log (links partial deliveries to their group)
+    dl_cols = {row[1] for row in conn.execute("PRAGMA table_info(delivery_log)").fetchall()}
+    if 'delivery_group_id' not in dl_cols:
+        conn.execute("ALTER TABLE delivery_log ADD COLUMN delivery_group_id INTEGER REFERENCES delivery_groups(id)")
+    if 'group_name' not in dl_cols:
+        conn.execute("ALTER TABLE delivery_log ADD COLUMN group_name TEXT")
+    conn.commit()
+
     # ----- Performance Indexes (Bug #15 fix) -----
     try:
         index_stmts = [
@@ -4148,8 +4156,21 @@ def dispatch(method, path, params, body, conn):
         )
         conn.commit()
         updated = conn.execute("SELECT * FROM order_items WHERE id=?", [iid]).fetchone()
+        # Check if ALL items on this order now have ETAs — if so, set the order-level ETA to the latest item ETA
+        oid_for_eta = item_row["order_id"]
+        all_items_eta = conn.execute(
+            "SELECT eta_date FROM order_items WHERE order_id=? AND status NOT IN ('F','dispatched','delivered','collected')",
+            [oid_for_eta]
+        ).fetchall()
+        if all_items_eta and all(row["eta_date"] for row in all_items_eta):
+            latest_eta = max(row["eta_date"] for row in all_items_eta)
+            conn.execute(
+                "UPDATE orders SET eta_date=?, eta_set_by=?, eta_set_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                [latest_eta, current_user["id"], oid_for_eta]
+            )
+            conn.commit()
         # Log per-item ETA notification
-        order_row = conn.execute("SELECT * FROM orders WHERE id=?", [item_row["order_id"]]).fetchone()
+        order_row = conn.execute("SELECT * FROM orders WHERE id=?", [oid_for_eta]).fetchone()
         if order_row:
             client = conn.execute("SELECT * FROM clients WHERE id=?", [order_row["client_id"]]).fetchone()
             if client and client["email"]:
@@ -4157,8 +4178,10 @@ def dispatch(method, path, params, body, conn):
                 pname = item_row["product_name"] or ""
                 qty = item_row["quantity"] or 0
                 email_body = f"Order {order_row['order_number']} — Item ETA Update:\n  - {sku} ({pname}) x {qty}: ETA {eta}"
-                log_and_send_notification(conn, order_row["id"], "eta_notification", client["email"],
+                log_and_send_notification(conn, oid_for_eta, "eta_notification", client["email"],
                     f"Item ETA Update for Order {order_row['order_number']}", email_body)
+        sse_notify("orders")
+        sse_notify("dispatch")
         return {"status": 200, "body": row_to_dict(updated)}
 
     # Batch ETA for order
@@ -4359,6 +4382,10 @@ def dispatch(method, path, params, body, conn):
                 return {"status": 404, "body": {"error": "Order item not found"}}
             item = row_to_dict(item)
             oid = item["order_id"]
+            # Block scheduling of unverified orders
+            parent_order = conn.execute("SELECT is_verified FROM orders WHERE id=?", [oid]).fetchone()
+            if parent_order and not parent_order["is_verified"]:
+                return {"status": 400, "body": {"error": "Order must be verified by Office before scheduling"}}
             # Check for duplicate schedule entry for this item in this zone
             existing = conn.execute("SELECT id FROM schedule_entries WHERE order_item_id=? AND zone_id=?", [order_item_id, body["zone_id"]]).fetchone()
             if existing:
@@ -4382,6 +4409,10 @@ def dispatch(method, path, params, body, conn):
                 return {"status": 409, "body": {"error": str(e)}}
         if not order_id:
             return {"status": 400, "body": {"error": "order_id or order_item_id is required"}}
+        # Block scheduling of unverified orders
+        parent_order_bulk = conn.execute("SELECT is_verified FROM orders WHERE id=?", [order_id]).fetchone()
+        if parent_order_bulk and not parent_order_bulk["is_verified"]:
+            return {"status": 400, "body": {"error": "Order must be verified by Office before scheduling"}}
         try:
             items = conn.execute("SELECT * FROM order_items WHERE order_id=? AND zone_id=?", [order_id, body["zone_id"]]).fetchall()
             if not items:
@@ -5667,23 +5698,45 @@ def dispatch(method, path, params, body, conn):
             ORDER BY dl.expected_date, dl.load_sequence, dl.id
         """, dl_vals).fetchall())
 
-        # Attach item info to each delivery
+        # Attach item info to each delivery (group-aware: partial deliveries only show group items)
         for d in deliveries:
             if d.get("order_id"):
-                items = rows_to_list(conn.execute("""
-                    SELECT oi.id, oi.sku_code, oi.product_name, oi.quantity, oi.produced_quantity, oi.status,
-                           oi.eta_date as item_eta, oi.kanban_status
-                    FROM order_items oi WHERE oi.order_id=?
-                """, [d["order_id"]]).fetchall())
+                # If this is a delivery group (partial delivery), only fetch the group's items
+                if d.get("delivery_group_id"):
+                    items = rows_to_list(conn.execute("""
+                        SELECT oi.id, oi.sku_code, oi.product_name, dgi.quantity, oi.produced_quantity, oi.status,
+                               oi.eta_date as item_eta, oi.kanban_status
+                        FROM delivery_group_items dgi
+                        JOIN order_items oi ON oi.id=dgi.order_item_id
+                        WHERE dgi.delivery_group_id=?
+                    """, [d["delivery_group_id"]]).fetchall())
+                else:
+                    items = rows_to_list(conn.execute("""
+                        SELECT oi.id, oi.sku_code, oi.product_name, oi.quantity, oi.produced_quantity, oi.status,
+                               oi.eta_date as item_eta, oi.kanban_status
+                        FROM order_items oi WHERE oi.order_id=?
+                    """, [d["order_id"]]).fetchall())
                 d["items"] = items
+                d["is_partial"] = 1 if d.get("delivery_group_id") else 0
                 total = len(items)
                 done = sum(1 for i in items if i["status"] in ('F', 'dispatched'))
                 d["progress"] = f"{done}/{total}"
                 d["all_finished"] = done == total
+                # Build SKU summary
+                sku_parts = []
+                for it in items[:3]:
+                    code = it.get("sku_code") or it.get("product_name") or "?"
+                    qty = it.get("quantity", 0)
+                    sku_parts.append(f"{code} \u00d7{qty}")
+                d["sku_summary"] = ", ".join(sku_parts)
+                if len(items) > 3:
+                    d["sku_summary"] += f" +{len(items)-3} more"
             else:
                 d["items"] = []
                 d["progress"] = "0/0"
                 d["all_finished"] = False
+                d["is_partial"] = 0
+                d["sku_summary"] = ""
             # Attach contractor assignments
             d["contractor_assignments"] = rows_to_list(conn.execute(
                 "SELECT * FROM contractor_assignments WHERE delivery_log_id=? AND status!='cancelled'",
@@ -5869,12 +5922,23 @@ def dispatch(method, path, params, body, conn):
         # Attach items to each delivery
         for d in deliveries:
             if d.get("order_id"):
-                items = rows_to_list(conn.execute("""
-                    SELECT oi.id, oi.sku_code, oi.product_name, oi.quantity, oi.produced_quantity,
-                           oi.status, oi.kanban_status
-                    FROM order_items oi WHERE oi.order_id=?
-                """, [d["order_id"]]).fetchall())
+                # If this is a delivery group (partial delivery), only fetch the group's items
+                if d.get("delivery_group_id"):
+                    items = rows_to_list(conn.execute("""
+                        SELECT oi.id, oi.sku_code, oi.product_name, dgi.quantity, oi.produced_quantity,
+                               oi.status, oi.kanban_status
+                        FROM delivery_group_items dgi
+                        JOIN order_items oi ON oi.id=dgi.order_item_id
+                        WHERE dgi.delivery_group_id=?
+                    """, [d["delivery_group_id"]]).fetchall())
+                else:
+                    items = rows_to_list(conn.execute("""
+                        SELECT oi.id, oi.sku_code, oi.product_name, oi.quantity, oi.produced_quantity,
+                               oi.status, oi.kanban_status
+                        FROM order_items oi WHERE oi.order_id=?
+                    """, [d["order_id"]]).fetchall())
                 d["items"] = items
+                d["is_partial"] = 1 if d.get("delivery_group_id") else 0
                 total = len(items)
                 done = sum(1 for i in items if i["status"] in ('F', 'dispatched'))
                 d["progress"] = f"{done}/{total}"
@@ -5925,10 +5989,17 @@ def dispatch(method, path, params, body, conn):
         """).fetchall())
         for d in unassigned_raw:
             if d.get("order_id"):
-                items = rows_to_list(conn.execute(
-                    "SELECT oi.sku_code, oi.product_name, oi.quantity, oi.status, oi.kanban_status FROM order_items oi WHERE oi.order_id=?",
-                    [d["order_id"]]).fetchall())
+                # If this is a delivery group (partial delivery), only fetch the group's items
+                if d.get("delivery_group_id"):
+                    items = rows_to_list(conn.execute(
+                        "SELECT oi.sku_code, oi.product_name, dgi.quantity, oi.status, oi.kanban_status FROM delivery_group_items dgi JOIN order_items oi ON oi.id=dgi.order_item_id WHERE dgi.delivery_group_id=?",
+                        [d["delivery_group_id"]]).fetchall())
+                else:
+                    items = rows_to_list(conn.execute(
+                        "SELECT oi.sku_code, oi.product_name, oi.quantity, oi.status, oi.kanban_status FROM order_items oi WHERE oi.order_id=?",
+                        [d["order_id"]]).fetchall())
                 d["items"] = items
+                d["is_partial"] = 1 if d.get("delivery_group_id") else 0
                 total = len(items); done = sum(1 for i in items if i["status"] in ('F','dispatched'))
                 d["progress"] = f"{done}/{total}"; d["all_finished"] = done == total
                 sku_parts = []
@@ -5998,6 +6069,7 @@ def dispatch(method, path, params, body, conn):
                                     "red_delivered":{"color":"#dc2626","label":"Delivered"}}.get(kanban_key,{"color":"#dc2626","label":"Pending Stock"})
                         run_entries_out.append({
                             "delivery_log_id": e.get("id"),
+                            "order_id": e.get("order_id"),
                             "order_number": e.get("order_number"),
                             "client_name": e.get("client_name"),
                             "sku_summary": e.get("sku_summary", ""),
@@ -6011,6 +6083,10 @@ def dispatch(method, path, params, body, conn):
                             "items": e.get("items", []),
                             "client_address": e.get("client_address"),
                             "order_kanban": kanban_key,
+                            "requested_delivery_date": e.get("requested_delivery_date"),
+                            "is_partial": e.get("is_partial", 0),
+                            "group_name": e.get("group_name"),
+                            "delivery_group_id": e.get("delivery_group_id"),
                         })
                     runs_out.append({
                         "id": run["id"],
@@ -6042,13 +6118,17 @@ def dispatch(method, path, params, body, conn):
                     "driver_id": cell_driver_id,
                     "driver_name": cell_driver_name or "",
                     "runs": runs_out,
-                    "unrun_entries": [{"delivery_log_id":e.get("id"),"order_number":e.get("order_number"),
+                    "unrun_entries": [{"delivery_log_id":e.get("id"),"order_id":e.get("order_id"),
+                                       "order_number":e.get("order_number"),
                                        "client_name":e.get("client_name"),"sku_summary":e.get("sku_summary",""),
                                        "kanban_status":e.get("order_kanban","red_pending"),
                                        "kanban_color":e.get("kanban_color","#dc2626"),
                                        "kanban_label":e.get("kanban_label","Pending Stock"),
                                        "estimated_minutes":e.get("estimated_minutes") or 30,
-                                       "status":e.get("status","pending"),"all_finished":e.get("all_finished",False)
+                                       "status":e.get("status","pending"),"all_finished":e.get("all_finished",False),
+                                       "requested_delivery_date":e.get("requested_delivery_date"),
+                                       "is_partial":e.get("is_partial",0),"group_name":e.get("group_name"),
+                                       "delivery_group_id":e.get("delivery_group_id")
                                        } for e in unrun_entries],
                     "truck_work_orders": truck_twos,
                     "capacity": {
@@ -6356,6 +6436,7 @@ def dispatch(method, path, params, body, conn):
         if method == "PUT":
             if not current_user:
                 return {"status": 401, "body": {"error": "Authentication required"}}
+            new_status = body.get("status")
             fields, vals = [], []
             for f in ["status", "driver_id", "departure_time", "return_time", "notes"]:
                 if f in body:
@@ -6364,7 +6445,43 @@ def dispatch(method, path, params, body, conn):
                 fields.append("updated_at=CURRENT_TIMESTAMP")
                 vals.append(run_id)
                 conn.execute(f"UPDATE dispatch_runs SET {', '.join(fields)} WHERE id=?", vals)
-                conn.commit()
+
+            # --- When run moves to in_transit (driver departs), cascade dispatch status ---
+            if new_status == "in_transit":
+                now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                # Update all linked delivery_log entries to in_transit
+                conn.execute("UPDATE delivery_log SET status='in_transit', updated_at=CURRENT_TIMESTAMP WHERE run_id=? AND status NOT IN ('delivered','collected','cancelled')", [run_id])
+                # Update linked orders/items to dispatched (group-aware)
+                dl_rows = conn.execute("SELECT order_id, delivery_group_id FROM delivery_log WHERE run_id=? AND order_id IS NOT NULL", [run_id]).fetchall()
+                for dlr in dl_rows:
+                    oid = dlr["order_id"] if isinstance(dlr, dict) else dlr[0]
+                    gid = dlr["delivery_group_id"] if isinstance(dlr, dict) else dlr[1]
+                    if gid:
+                        group_item_ids = [r[0] for r in conn.execute(
+                            "SELECT order_item_id FROM delivery_group_items WHERE delivery_group_id=?", [gid]
+                        ).fetchall()]
+                        if group_item_ids:
+                            ph = ",".join("?" for _ in group_item_ids)
+                            conn.execute(f"UPDATE order_items SET status='dispatched' WHERE id IN ({ph}) AND status='F'", group_item_ids)
+                        conn.execute("UPDATE delivery_groups SET status='dispatched', updated_at=CURRENT_TIMESTAMP WHERE id=?", [gid])
+                        remaining = conn.execute(
+                            "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('dispatched','delivered','collected')", [oid]
+                        ).fetchone()[0]
+                        if remaining == 0:
+                            conn.execute("UPDATE orders SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status NOT IN ('delivered','collected')", [oid])
+                    else:
+                        conn.execute("UPDATE orders SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status NOT IN ('delivered','collected')", [oid])
+                        conn.execute("UPDATE order_items SET status='dispatched' WHERE order_id=? AND status='F'", [oid])
+                    update_kanban_statuses(conn, oid)
+                sse_notify("dispatch")
+                sse_notify("orders")
+
+            # --- When run completes, notify ---
+            if new_status == "completed":
+                sse_notify("dispatch")
+                sse_notify("orders")
+
+            conn.commit()
             row = conn.execute("SELECT * FROM dispatch_runs WHERE id=?", [run_id]).fetchone()
             return {"status": 200, "body": row_to_dict(row)}
         if method == "DELETE":
@@ -6440,32 +6557,64 @@ def dispatch(method, path, params, body, conn):
         run_id = int(m["id"])
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         # Gate check: all order items must be 'F' (QA complete) before dispatch
-        gate_dl_rows = conn.execute("SELECT dl.order_id, o.order_number FROM delivery_log dl LEFT JOIN orders o ON o.id=dl.order_id WHERE dl.run_id=? AND dl.order_id IS NOT NULL", [run_id]).fetchall()
+        # For partial delivery groups, only check the group's items
+        gate_dl_rows = conn.execute("SELECT dl.order_id, dl.delivery_group_id, o.order_number FROM delivery_log dl LEFT JOIN orders o ON o.id=dl.order_id WHERE dl.run_id=? AND dl.order_id IS NOT NULL", [run_id]).fetchall()
         for gate_dlr in gate_dl_rows:
-            gate_oid = gate_dlr[0] if not isinstance(gate_dlr, dict) else gate_dlr["order_id"]
-            gate_order_number = gate_dlr[1] if not isinstance(gate_dlr, dict) else gate_dlr.get("order_number", gate_oid)
+            gate_oid = gate_dlr["order_id"] if isinstance(gate_dlr, dict) else gate_dlr[0]
+            gate_gid = gate_dlr["delivery_group_id"] if isinstance(gate_dlr, dict) else gate_dlr[1]
+            gate_order_number = gate_dlr["order_number"] if isinstance(gate_dlr, dict) else gate_dlr[2]
             if gate_oid:
-                incomplete = conn.execute(
-                    "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('F', 'dispatched')",
-                    [gate_oid]
-                ).fetchone()[0]
+                if gate_gid:
+                    # Partial delivery: only check items in this delivery group
+                    incomplete = conn.execute(
+                        "SELECT COUNT(*) FROM delivery_group_items dgi JOIN order_items oi ON oi.id=dgi.order_item_id WHERE dgi.delivery_group_id=? AND oi.status NOT IN ('F', 'dispatched')",
+                        [gate_gid]
+                    ).fetchone()[0]
+                else:
+                    incomplete = conn.execute(
+                        "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('F', 'dispatched')",
+                        [gate_oid]
+                    ).fetchone()[0]
                 if incomplete > 0:
                     return {"status": 400, "body": {"error": f"Order {gate_order_number} has {incomplete} items not yet QA-approved. Cannot dispatch."}}
         conn.execute("UPDATE dispatch_runs SET status='in_transit', departure_time=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [now, run_id])
         # Update all linked delivery_log entries
         conn.execute("UPDATE delivery_log SET status='in_transit', updated_at=CURRENT_TIMESTAMP WHERE run_id=?", [run_id])
-        # Update linked orders to 'dispatched'
-        dl_rows = conn.execute("SELECT order_id FROM delivery_log WHERE run_id=? AND order_id IS NOT NULL", [run_id]).fetchall()
+        # Update linked orders to 'dispatched' (group-aware for partial deliveries)
+        dl_rows = conn.execute("SELECT order_id, delivery_group_id FROM delivery_log WHERE run_id=? AND order_id IS NOT NULL", [run_id]).fetchall()
         for dlr in dl_rows:
-            oid = dlr[0] if not isinstance(dlr, dict) else dlr["order_id"]
-            conn.execute("UPDATE orders SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status NOT IN ('delivered','collected')", [oid])
-            conn.execute("UPDATE order_items SET status='dispatched' WHERE order_id=? AND status='F'", [oid])
+            oid = dlr["order_id"] if isinstance(dlr, dict) else dlr[0]
+            gid = dlr["delivery_group_id"] if isinstance(dlr, dict) else dlr[1]
+            if gid:
+                # Partial delivery: only dispatch items in this delivery group
+                group_item_ids = [r[0] for r in conn.execute(
+                    "SELECT order_item_id FROM delivery_group_items WHERE delivery_group_id=?", [gid]
+                ).fetchall()]
+                if group_item_ids:
+                    ph = ",".join("?" for _ in group_item_ids)
+                    conn.execute(f"UPDATE order_items SET status='dispatched' WHERE id IN ({ph}) AND status='F'", group_item_ids)
+                # Update delivery_group status
+                conn.execute("UPDATE delivery_groups SET status='dispatched', updated_at=CURRENT_TIMESTAMP WHERE id=?", [gid])
+                # Check if ALL items in the order are now dispatched/delivered — if so, update order status
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('dispatched','delivered','collected')", [oid]
+                ).fetchone()[0]
+                if remaining == 0:
+                    conn.execute("UPDATE orders SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status NOT IN ('delivered','collected')", [oid])
+                # Inventory deduction for group items
+                dispatched_items = conn.execute(
+                    f"SELECT oi.sku_id, dgi.quantity FROM delivery_group_items dgi JOIN order_items oi ON oi.id=dgi.order_item_id WHERE dgi.delivery_group_id=? AND oi.sku_id IS NOT NULL",
+                    [gid]
+                ).fetchall()
+            else:
+                conn.execute("UPDATE orders SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status NOT IN ('delivered','collected')", [oid])
+                conn.execute("UPDATE order_items SET status='dispatched' WHERE order_id=? AND status='F'", [oid])
+                # P3 Issue 10: Decrement inventory on dispatch and log movements
+                dispatched_items = conn.execute(
+                    "SELECT oi.sku_id, oi.quantity FROM order_items oi WHERE oi.order_id=? AND oi.status='dispatched' AND oi.sku_id IS NOT NULL",
+                    [oid]
+                ).fetchall()
             update_kanban_statuses(conn, oid)
-            # P3 Issue 10: Decrement inventory on dispatch and log movements
-            dispatched_items = conn.execute(
-                "SELECT oi.sku_id, oi.quantity FROM order_items oi WHERE oi.order_id=? AND oi.status='dispatched' AND oi.sku_id IS NOT NULL",
-                [oid]
-            ).fetchall()
             for di in dispatched_items:
                 di_sku = di["sku_id"] if isinstance(di, dict) else di[0]
                 di_qty = di["quantity"] if isinstance(di, dict) else di[1]
@@ -6493,10 +6642,31 @@ def dispatch(method, path, params, body, conn):
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("UPDATE delivery_log SET status='delivered', actual_date=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [now[:10], dl_id])
         dl = conn.execute("SELECT * FROM delivery_log WHERE id=?", [dl_id]).fetchone()
-        order_id = dl["order_id"] if isinstance(dl, dict) else dl[1]
+        order_id = dl["order_id"]
+        try:
+            gid = dl["delivery_group_id"]
+        except (IndexError, KeyError):
+            gid = None
         if order_id:
-            conn.execute("UPDATE orders SET status='delivered' WHERE id=?", [order_id])
-            conn.execute("UPDATE order_items SET status='delivered' WHERE order_id=? AND status='dispatched'", [order_id])
+            if gid:
+                # Partial delivery: only mark this group's items as delivered
+                group_item_ids = [r[0] for r in conn.execute(
+                    "SELECT order_item_id FROM delivery_group_items WHERE delivery_group_id=?", [gid]
+                ).fetchall()]
+                if group_item_ids:
+                    ph = ",".join("?" for _ in group_item_ids)
+                    conn.execute(f"UPDATE order_items SET status='delivered' WHERE id IN ({ph}) AND status='dispatched'", group_item_ids)
+                # Update delivery_group status
+                conn.execute("UPDATE delivery_groups SET status='delivered', updated_at=CURRENT_TIMESTAMP WHERE id=?", [gid])
+                # Check if ALL items in the order are now delivered — if so, update order status
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('delivered','collected')", [order_id]
+                ).fetchone()[0]
+                if remaining == 0:
+                    conn.execute("UPDATE orders SET status='delivered' WHERE id=?", [order_id])
+            else:
+                conn.execute("UPDATE orders SET status='delivered' WHERE id=?", [order_id])
+                conn.execute("UPDATE order_items SET status='delivered' WHERE order_id=? AND status='dispatched'", [order_id])
             update_kanban_statuses(conn, order_id)
         conn.commit()
         sse_notify("dispatch")
@@ -7589,6 +7759,7 @@ def dispatch(method, path, params, body, conn):
             LEFT JOIN clients c ON c.id=o.client_id
             WHERE (oi.zone_id=? OR oi.zone_id IS NULL) AND o.status NOT IN ('F','dispatched','delivered','collected')
               AND oi.status NOT IN ('F','dispatched')
+              AND o.is_verified = 1
         """, [zone_id]).fetchall())
         intake_queue = [
             dict(item, inventory_on_hand=inv_map.get(item.get("sku_id"), 0))
@@ -7707,6 +7878,7 @@ def dispatch(method, path, params, body, conn):
             LEFT JOIN clients c ON c.id=o.client_id
             WHERE (oi.zone_id=? OR oi.zone_id IS NULL) AND o.status NOT IN ('F','dispatched','delivered','collected')
               AND oi.status NOT IN ('F','dispatched')
+              AND o.is_verified = 1
         """, [zone_id]).fetchall())
         intake_queue = [
             dict(item, inventory_on_hand=inv_map.get(item.get("sku_id"), 0))
@@ -7813,6 +7985,7 @@ def dispatch(method, path, params, body, conn):
             LEFT JOIN clients c ON c.id=o.client_id
             WHERE (oi.zone_id=? OR oi.zone_id IS NULL) AND o.status NOT IN ('F','dispatched','delivered','collected')
               AND oi.status NOT IN ('F','dispatched')
+              AND o.is_verified = 1
         """, [zid]).fetchall())
         iq = [dict(it, inventory_on_hand=inv_mp.get(it.get("sku_id"), 0))
               for it in iq_raw if it["id"] not in all_sched and it["id"] not in null_zone_sched]
@@ -8249,7 +8422,7 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": row_to_dict(
             conn.execute("SELECT * FROM delivery_run_stages WHERE id=?", [stage_id]).fetchone())}
 
-    # ----- UPDATE DELIVERY STATUS -----
+    # ----- UPDATE DELIVERY STATUS (driver app + office, cascades to orders/Kanban) -----
     if method == "PUT" and path == "/driver/delivery/status":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
@@ -8259,24 +8432,61 @@ def dispatch(method, path, params, body, conn):
             return {"status": 400, "body": {"error": "delivery_log_id and status required"}}
         conn.execute("UPDATE delivery_log SET status=?, updated_at=? WHERE id=?",
                      [new_status, datetime.now(timezone.utc).isoformat(), dl_id])
-        # Also update the order status if delivery is complete
-        if new_status in ("delivered", "collected"):
-            dl_row = conn.execute("SELECT order_id FROM delivery_log WHERE id=?", [dl_id]).fetchone()
-            if dl_row and dl_row[0]:
-                order_id_dl = dl_row[0]
+        # Get delivery details for group-aware cascading
+        dl_full = conn.execute("SELECT order_id, delivery_group_id FROM delivery_log WHERE id=?", [dl_id]).fetchone()
+        order_id_dl = dl_full["order_id"] if dl_full else None
+        gid_dl = dl_full["delivery_group_id"] if dl_full else None
+
+        if new_status == "in_transit" and order_id_dl:
+            # Driver set off — cascade to dispatched on orders/items
+            if gid_dl:
+                group_item_ids = [r[0] for r in conn.execute(
+                    "SELECT order_item_id FROM delivery_group_items WHERE delivery_group_id=?", [gid_dl]
+                ).fetchall()]
+                if group_item_ids:
+                    ph = ",".join("?" for _ in group_item_ids)
+                    conn.execute(f"UPDATE order_items SET status='dispatched' WHERE id IN ({ph}) AND status='F'", group_item_ids)
+                conn.execute("UPDATE delivery_groups SET status='dispatched', updated_at=CURRENT_TIMESTAMP WHERE id=?", [gid_dl])
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('dispatched','delivered','collected')", [order_id_dl]
+                ).fetchone()[0]
+                if remaining == 0:
+                    conn.execute("UPDATE orders SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status NOT IN ('delivered','collected')", [order_id_dl])
+            else:
+                conn.execute("UPDATE orders SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status NOT IN ('delivered','collected')", [order_id_dl])
+                conn.execute("UPDATE order_items SET status='dispatched' WHERE order_id=? AND status='F'", [order_id_dl])
+            update_kanban_statuses(conn, order_id_dl)
+
+        elif new_status in ("delivered", "collected") and order_id_dl:
+            # Delivery complete — cascade final status (group-aware)
+            if gid_dl:
+                group_item_ids = [r[0] for r in conn.execute(
+                    "SELECT order_item_id FROM delivery_group_items WHERE delivery_group_id=?", [gid_dl]
+                ).fetchall()]
+                if group_item_ids:
+                    ph = ",".join("?" for _ in group_item_ids)
+                    conn.execute(f"UPDATE order_items SET status=? WHERE id IN ({ph}) AND status IN ('F','dispatched')",
+                                 [new_status] + group_item_ids)
+                conn.execute("UPDATE delivery_groups SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [new_status, gid_dl])
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('delivered','collected')", [order_id_dl]
+                ).fetchone()[0]
+                if remaining == 0:
+                    conn.execute("UPDATE orders SET status=?, dispatched_at=? WHERE id=?",
+                                 [new_status, datetime.now(timezone.utc).isoformat(), order_id_dl])
+            else:
                 conn.execute("UPDATE orders SET status=?, dispatched_at=? WHERE id=?",
                              [new_status, datetime.now(timezone.utc).isoformat(), order_id_dl])
                 conn.execute("UPDATE order_items SET status=? WHERE order_id=? AND status IN ('F','dispatched')",
                              [new_status, order_id_dl])
-                conn.commit()
-                update_kanban_statuses(conn, order_id_dl)
-        else:
-            conn.commit()
+            update_kanban_statuses(conn, order_id_dl)
+
+        conn.commit()
         sse_notify("dispatch")
         sse_notify("orders")
         return {"status": 200, "body": {"ok": True}}
 
-    # ----- COMPLETE DELIVERY (triggers cost calc) -----
+    # ----- COMPLETE DELIVERY (triggers cost calc + Kanban/status cascade) -----
     if method == "POST" and path == "/driver/delivery/complete":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
@@ -8284,85 +8494,113 @@ def dispatch(method, path, params, body, conn):
         shift_id = body.get("shift_id")
         if not dl_id or not shift_id:
             return {"status": 400, "body": {"error": "delivery_log_id and shift_id required"}}
-        # Try to get total_km from odometer readings first
-        total_km = body.get("total_km", 0)
-        if not total_km:
-            # Calculate from stage odometer readings
-            stages = conn.execute("""
-                SELECT odometer_start, odometer_end, manual_km
-                FROM delivery_run_stages
-                WHERE delivery_log_id=? AND driver_shift_id=?
-                ORDER BY started_at
-            """, [dl_id, shift_id]).fetchall()
-            for s in stages:
-                sd_stage = dict(zip(["odometer_start", "odometer_end", "manual_km"], s))
-                if sd_stage.get("manual_km"):
-                    total_km += sd_stage["manual_km"]
-                elif sd_stage.get("odometer_start") and sd_stage.get("odometer_end"):
-                    total_km += (sd_stage["odometer_end"] - sd_stage["odometer_start"])
-        # Also try from logbook entries
-        if not total_km:
-            logbook_entries = conn.execute("""
-                SELECT odometer_reading FROM driver_logbook
-                WHERE driver_shift_id=? AND delivery_log_id=? AND odometer_reading IS NOT NULL
-                ORDER BY recorded_at
-            """, [shift_id, dl_id]).fetchall()
-            if len(logbook_entries) >= 2:
-                readings = [r[0] for r in logbook_entries if r[0] is not None]
-                if len(readings) >= 2:
-                    total_km = max(readings) - min(readings)
-        tolls = body.get("tolls", 0)
-        # Calculate cost
-        shift = conn.execute("SELECT * FROM driver_shifts WHERE id=?", [shift_id]).fetchone()
-        if not shift:
-            return {"status": 404, "body": {"error": "Shift not found"}}
-        shift_d = row_to_dict(shift)
-        finance = conn.execute("SELECT * FROM truck_finance_config WHERE truck_id=?",
-                               [shift_d["truck_id"]]).fetchone()
-        # Sum stage durations for this delivery
-        total_mins = conn.execute(
-            "SELECT COALESCE(SUM(duration_minutes), 0) FROM delivery_run_stages WHERE delivery_log_id=? AND driver_shift_id=?",
-            [dl_id, shift_id]).fetchone()[0]
+
+        # --- Cost calculation (wrapped in try/except so it never blocks delivery completion) ---
         costs = {"driver_cost": 0, "fuel_cost": 0, "rego_cost": 0, "insurance_cost": 0,
-                 "rm_cost": 0, "tyre_cost": 0, "tolls": tolls, "total_cost": 0}
-        if finance:
-            f = row_to_dict(finance)
-            hours = total_mins / 60 if total_mins else 0
-            costs["driver_cost"] = round(hours * f["driver_hourly_rate"], 2)
-            costs["fuel_cost"] = round((total_km / 100) * f["avg_fuel_consumption_per_100km"] * f["fuel_cost_per_litre"], 2) if total_km else 0
-            op_days = f["operating_days_per_year"] or 230
-            costs["rego_cost"] = round(f["annual_rego_cost"] / op_days, 2)
-            costs["insurance_cost"] = round(f["annual_insurance_cost"] / op_days, 2)
-            costs["rm_cost"] = round(f["rm_budget_monthly"] / (op_days / 12), 2)
-            costs["tyre_cost"] = round(total_km * f["tyre_cost_per_km"], 2) if total_km else 0
-        costs["total_cost"] = round(sum([costs["driver_cost"], costs["fuel_cost"], costs["rego_cost"],
-                                         costs["insurance_cost"], costs["rm_cost"], costs["tyre_cost"],
-                                         costs["tolls"]]), 2)
-        # Insert cost record
-        conn.execute("""INSERT INTO delivery_run_costs
-            (delivery_log_id, driver_shift_id, driver_cost, fuel_cost, rego_cost, insurance_cost,
-             rm_cost, tyre_cost, tolls, total_cost, total_km, total_minutes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [dl_id, shift_id, costs["driver_cost"], costs["fuel_cost"], costs["rego_cost"],
-             costs["insurance_cost"], costs["rm_cost"], costs["tyre_cost"], costs["tolls"],
-             costs["total_cost"], total_km, total_mins])
-        # Check if this is a collection or delivery
-        dl_row = conn.execute("SELECT delivery_type FROM delivery_log WHERE id=?", [dl_id]).fetchone()
-        final_status = "collected" if dl_row and dl_row[0] == "collection" else "delivered"
+                 "rm_cost": 0, "tyre_cost": 0, "tolls": body.get("tolls", 0) or 0, "total_cost": 0}
+        try:
+            total_km = body.get("total_km") or 0
+            if not total_km:
+                stages = conn.execute("""
+                    SELECT odometer_start, odometer_end, manual_km
+                    FROM delivery_run_stages
+                    WHERE delivery_log_id=? AND driver_shift_id=?
+                    ORDER BY started_at
+                """, [dl_id, shift_id]).fetchall()
+                for s in stages:
+                    sd_stage = row_to_dict(s) if hasattr(s, 'keys') else dict(zip(["odometer_start", "odometer_end", "manual_km"], s))
+                    if sd_stage.get("manual_km"):
+                        total_km = (total_km or 0) + sd_stage["manual_km"]
+                    elif sd_stage.get("odometer_start") and sd_stage.get("odometer_end"):
+                        total_km = (total_km or 0) + (sd_stage["odometer_end"] - sd_stage["odometer_start"])
+            if not total_km:
+                logbook_entries = conn.execute("""
+                    SELECT odometer_reading FROM driver_logbook
+                    WHERE driver_shift_id=? AND delivery_log_id=? AND odometer_reading IS NOT NULL
+                    ORDER BY recorded_at
+                """, [shift_id, dl_id]).fetchall()
+                if len(logbook_entries) >= 2:
+                    readings = [r[0] for r in logbook_entries if r[0] is not None]
+                    if len(readings) >= 2:
+                        total_km = max(readings) - min(readings)
+            shift_row = conn.execute("SELECT * FROM driver_shifts WHERE id=?", [shift_id]).fetchone()
+            if not shift_row:
+                return {"status": 404, "body": {"error": "Shift not found"}}
+            shift_d = row_to_dict(shift_row)
+            finance = conn.execute("SELECT * FROM truck_finance_config WHERE truck_id=?",
+                                   [shift_d["truck_id"]]).fetchone()
+            total_mins = conn.execute(
+                "SELECT COALESCE(SUM(duration_minutes), 0) FROM delivery_run_stages WHERE delivery_log_id=? AND driver_shift_id=?",
+                [dl_id, shift_id]).fetchone()[0] or 0
+            if finance:
+                f = row_to_dict(finance)
+                hours = total_mins / 60 if total_mins else 0
+                costs["driver_cost"] = round(hours * (f.get("driver_hourly_rate") or 0), 2)
+                if total_km:
+                    costs["fuel_cost"] = round((total_km / 100) * (f.get("avg_fuel_consumption_per_100km") or 0) * (f.get("fuel_cost_per_litre") or 0), 2)
+                    costs["tyre_cost"] = round(total_km * (f.get("tyre_cost_per_km") or 0), 2)
+                op_days = f.get("operating_days_per_year") or 230
+                costs["rego_cost"] = round((f.get("annual_rego_cost") or 0) / op_days, 2)
+                costs["insurance_cost"] = round((f.get("annual_insurance_cost") or 0) / op_days, 2)
+                costs["rm_cost"] = round((f.get("rm_budget_monthly") or 0) / (op_days / 12), 2)
+            costs["total_cost"] = round(sum([costs["driver_cost"], costs["fuel_cost"], costs["rego_cost"],
+                                             costs["insurance_cost"], costs["rm_cost"], costs["tyre_cost"],
+                                             costs["tolls"]]), 2)
+            conn.execute("""INSERT INTO delivery_run_costs
+                (delivery_log_id, driver_shift_id, driver_cost, fuel_cost, rego_cost, insurance_cost,
+                 rm_cost, tyre_cost, tolls, total_cost, total_km, total_minutes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                [dl_id, shift_id, costs["driver_cost"], costs["fuel_cost"], costs["rego_cost"],
+                 costs["insurance_cost"], costs["rm_cost"], costs["tyre_cost"], costs["tolls"],
+                 costs["total_cost"], total_km or 0, total_mins or 0])
+        except Exception as cost_err:
+            import logging
+            logging.warning(f"Cost calculation failed for dl_id={dl_id}: {cost_err}")
+            # Non-fatal: continue with delivery completion
+
+        # --- Mark delivery_log as delivered/collected ---
+        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        now_iso = datetime.now(timezone.utc).isoformat()
+        dl_full = conn.execute("SELECT * FROM delivery_log WHERE id=?", [dl_id]).fetchone()
+        if not dl_full:
+            return {"status": 404, "body": {"error": "Delivery log entry not found"}}
+        dl_dict = row_to_dict(dl_full)
+        final_status = "collected" if dl_dict.get("delivery_type") == "collection" else "delivered"
         conn.execute("UPDATE delivery_log SET status=?, actual_date=?, updated_at=? WHERE id=?",
-                     [final_status, datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                      datetime.now(timezone.utc).isoformat(), dl_id])
-        # Update the parent order status too
-        dl_order = conn.execute("SELECT order_id FROM delivery_log WHERE id=?", [dl_id]).fetchone()
-        if dl_order and dl_order[0]:
-            order_id = dl_order[0]
-            conn.execute("UPDATE orders SET status=?, dispatched_at=? WHERE id=?",
-                         [final_status, datetime.now(timezone.utc).isoformat(), order_id])
-            # Update order items to match delivery status
-            conn.execute("UPDATE order_items SET status=? WHERE order_id=? AND status IN ('F', 'dispatched')",
-                         [final_status, order_id])
+                     [final_status, now_str, now_iso, dl_id])
+
+        # --- Update order/items status (delivery-group aware) ---
+        order_id = dl_dict.get("order_id")
+        gid = dl_dict.get("delivery_group_id")
+        if order_id:
+            if gid:
+                # Partial delivery: only mark this group's items
+                group_item_ids = [r[0] for r in conn.execute(
+                    "SELECT order_item_id FROM delivery_group_items WHERE delivery_group_id=?", [gid]
+                ).fetchall()]
+                if group_item_ids:
+                    ph = ",".join("?" for _ in group_item_ids)
+                    conn.execute(f"UPDATE order_items SET status=? WHERE id IN ({ph}) AND status IN ('F','dispatched')",
+                                 [final_status] + group_item_ids)
+                conn.execute("UPDATE delivery_groups SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                             [final_status, gid])
+                # Check if ALL items in the order are now delivered/collected
+                remaining = conn.execute(
+                    "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('delivered','collected')",
+                    [order_id]).fetchone()[0]
+                if remaining == 0:
+                    conn.execute("UPDATE orders SET status=?, dispatched_at=? WHERE id=?",
+                                 [final_status, now_iso, order_id])
+            else:
+                # Full order delivery
+                conn.execute("UPDATE orders SET status=?, dispatched_at=? WHERE id=?",
+                             [final_status, now_iso, order_id])
+                conn.execute("UPDATE order_items SET status=? WHERE order_id=? AND status IN ('F','dispatched')",
+                             [final_status, order_id])
             update_kanban_statuses(conn, order_id)
         conn.commit()
+        sse_notify("dispatch")
+        sse_notify("orders")
         return {"status": 200, "body": costs}
 
     # ----- TRUCK FINANCE CONFIG -----
@@ -11312,9 +11550,23 @@ def dispatch(method, path, params, body, conn):
             "INSERT INTO delivery_groups (order_id, group_name, requested_delivery_date, status, notes) VALUES (?,?,?,?,?)",
             [oid, body["group_name"], body.get("requested_delivery_date"), body.get("status", "pending"), body.get("notes")]
         )
+        dg_id = cur.lastrowid
         conn.commit()
-        row = conn.execute("SELECT * FROM delivery_groups WHERE id=?", [cur.lastrowid]).fetchone()
-        return {"status": 201, "body": row_to_dict(row)}
+        # Auto-create a delivery_log entry for this group so it appears on the dispatch board
+        order_full_row = conn.execute("SELECT * FROM orders WHERE id=?", [oid]).fetchone()
+        delivery_type = (order_full_row["delivery_type"] if order_full_row else None) or "delivery"
+        group_name = body["group_name"]
+        dl_cur = conn.execute(
+            "INSERT INTO delivery_log (order_id, delivery_group_id, group_name, expected_date, delivery_type, status, notes) VALUES (?,?,?,?,?,?,?)",
+            [oid, dg_id, group_name, body.get("requested_delivery_date"), delivery_type, "pending",
+             f"Partial delivery: {group_name}"]
+        )
+        conn.commit()
+        sse_notify("dispatch")
+        row = conn.execute("SELECT * FROM delivery_groups WHERE id=?", [dg_id]).fetchone()
+        result = row_to_dict(row)
+        result["delivery_log_id"] = dl_cur.lastrowid
+        return {"status": 201, "body": result}
 
     if m and method == "GET":
         if not current_user:
