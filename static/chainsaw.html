@@ -9,9 +9,9 @@
   <title>Hyne Pallets — Chainsaw</title>
   <link rel="manifest" href="/manifest-chainsaw.json" />
   <meta name="theme-color" content="#07324C" />
-  <script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" integrity="sha384-tMH8h3BGESGckSAVGZ82T9n90ztNXxvdwvdM6UoR56cYcf+0iGXBliJ29D+wZ/x8" crossorigin="anonymous"></script>
-  <script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" integrity="sha384-bm7MnzvK++ykSwVJ2tynSE5TRdN+xL418osEVF2DE/L/gfWHj91J2Sphe582B1Bh" crossorigin="anonymous"></script>
-  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js" integrity="sha384-AISI5AuDG6E8DeEiFMVB3rGQxhZt24OU0avMp+GMV64+tpnA3+Z6F5MT0f96iPva" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     body { margin:0; padding:0; background:#07324C; font-family:'Segoe UI',system-ui,-apple-system,sans-serif; font-size:18px; color:white; min-height:100vh; }
@@ -39,7 +39,6 @@ const api = async (path, options = {}, token = null) => {
   const headers = { 'Content-Type': 'application/json' };
   if (token) headers['Authorization'] = `Bearer ${token}`;
   const res = await fetch(API_BASE + path, { ...options, headers });
-  if (res.status === 401) { if (token) { localStorage.removeItem(SESSION_KEY); window.location.reload(); } throw new Error('Authentication required'); }
   if (!res.ok) throw new Error(`API ${res.status}`);
   return res.json();
 };
@@ -64,7 +63,7 @@ const PinLogin = ({ onLogin }) => {
       const data = await api('/driver/pin-login', { method: 'POST', body: JSON.stringify({ pin: p }) });
       if (data.token) {
         // Verify this user has chainsaw access
-        if (data.user && (data.user.role === 'chainsaw_operator' || data.user.role === 'executive' || data.user.role === 'office' || data.user.role === 'floor_worker')) {
+        if (data.user && (data.user.role === 'chainsaw' || data.user.role === 'executive' || data.user.role === 'admin' || data.user.role === 'floor_worker')) {
           onLogin(data);
         } else {
           setError('Access denied for this role'); setPin('');
@@ -72,7 +71,7 @@ const PinLogin = ({ onLogin }) => {
       } else {
         setError('Invalid PIN'); setPin('');
       }
-    } catch(e) {
+    } catch {
       setError('Invalid PIN — try again'); setPin('');
     }
     setLoading(false);
@@ -117,7 +116,7 @@ const App = () => {
             setNeedLogin(true);
           }
         }).catch(() => { localStorage.removeItem(SESSION_KEY); setNeedLogin(true); });
-      } catch(e) { localStorage.removeItem(SESSION_KEY); setNeedLogin(true); }
+      } catch { localStorage.removeItem(SESSION_KEY); setNeedLogin(true); }
     } else {
       setNeedLogin(true);
     }
