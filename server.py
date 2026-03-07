@@ -3010,7 +3010,7 @@ def sync_order_status(conn, order_id):
     new_status = compute_order_status(conn, order_id)
     items = conn.execute("SELECT status FROM order_items WHERE order_id=?", [order_id]).fetchall()
     total = len(items)
-    finished = sum(1 for r in items if r[0] in ('F', 'dispatched'))
+    finished = sum(1 for r in items if r[0] in ('F', 'dispatched', 'delivered', 'collected'))
     progress = f"{finished}/{total} items complete" if total > 0 else "0/0 items complete"
     conn.execute(
         "UPDATE orders SET status=?, progress=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
@@ -3661,6 +3661,7 @@ def dispatch(method, path, params, body, conn):
             )
             conn.commit()
             sync_order_status(conn, oid)
+            update_kanban_statuses(conn, oid)
             log_audit(conn, current_user["id"], "docking_complete_forced", "orders", oid)
         else:
             # Standard: promote only C-status items to R
@@ -3670,6 +3671,7 @@ def dispatch(method, path, params, body, conn):
             )
             conn.commit()
             sync_order_status(conn, oid)
+            update_kanban_statuses(conn, oid)
             log_audit(conn, current_user["id"], "docking_complete", "orders", oid)
         return {"status": 200, "body": order_full(conn, oid)}
 
@@ -3705,6 +3707,7 @@ def dispatch(method, path, params, body, conn):
         conn.commit()
         # Sync order status
         sync_order_status(conn, item_row["order_id"])
+        update_kanban_statuses(conn, item_row["order_id"])
         log_audit(conn, current_user["id"], "item_docking_complete", "order_items", iid)
         updated = conn.execute("SELECT * FROM order_items WHERE id=?", [iid]).fetchone()
         return {"status": 200, "body": row_to_dict(updated)}
@@ -3882,19 +3885,33 @@ def dispatch(method, path, params, body, conn):
             if new_status == 'dispatched':
                 conn.execute("UPDATE order_items SET status='dispatched' WHERE order_id=? AND status='F'", [oid])
             conn.commit()
+            update_kanban_statuses(conn, oid)
         elif new_status == 'P':
             # Promote R items to P
             conn.execute("UPDATE order_items SET status='P' WHERE order_id=? AND status='R'", [oid])
             conn.commit()
             sync_order_status(conn, oid)
+            update_kanban_statuses(conn, oid)
         elif new_status == 'F':
             # Promote all non-dispatched items to F
             conn.execute("UPDATE order_items SET status='F' WHERE order_id=? AND status NOT IN ('dispatched')", [oid])
             conn.commit()
             sync_order_status(conn, oid)
+            update_kanban_statuses(conn, oid)
+            # Auto-create delivery_log entry so dispatch board can see this order
+            existing_dl = conn.execute("SELECT id FROM delivery_log WHERE order_id=?", [oid]).fetchone()
+            if not existing_dl:
+                order_row_dl = conn.execute("SELECT * FROM orders WHERE id=?", [oid]).fetchone()
+                delivery_type = (order_row_dl["delivery_type"] if order_row_dl else None) or "delivery"
+                conn.execute(
+                    "INSERT INTO delivery_log (order_id, status, delivery_type, notes, created_at) VALUES (?, 'pending', ?, 'Auto-created: all items reached production complete', CURRENT_TIMESTAMP)",
+                    [oid, delivery_type]
+                )
+                conn.commit()
         else:
             conn.execute("UPDATE orders SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", [new_status, oid])
             conn.commit()
+            update_kanban_statuses(conn, oid)
         log_audit(conn, current_user["id"], f"status_change_{old_status}_to_{new_status}", "orders", oid)
         return {"status": 200, "body": order_full(conn, oid)}
 
@@ -4800,6 +4817,21 @@ def dispatch(method, path, params, body, conn):
                         conn.execute("INSERT INTO inventory (sku_id, units_on_hand, units_allocated) VALUES (?,?,0)",
                             [item["sku_id"], produced_qty])
                 conn.commit()
+                # Auto-create delivery_log when all items in order reach F (production complete)
+                pending_items = conn.execute(
+                    "SELECT COUNT(*) FROM order_items WHERE order_id=? AND status NOT IN ('F','dispatched','delivered')",
+                    [item["order_id"]]
+                ).fetchone()[0]
+                if pending_items == 0:
+                    existing_dl = conn.execute("SELECT id FROM delivery_log WHERE order_id=?", [item["order_id"]]).fetchone()
+                    if not existing_dl:
+                        order_for_dl = conn.execute("SELECT * FROM orders WHERE id=?", [item["order_id"]]).fetchone()
+                        dl_type = (order_for_dl["delivery_type"] if order_for_dl else None) or "delivery"
+                        conn.execute(
+                            "INSERT INTO delivery_log (order_id, status, delivery_type, notes, created_at) VALUES (?, 'pending', ?, 'Auto-created: QA approved, all items production complete', CURRENT_TIMESTAMP)",
+                            [item["order_id"], dl_type]
+                        )
+                        conn.commit()
         row = conn.execute("SELECT * FROM qa_inspections WHERE id=?", [iid]).fetchone()
         return {"status": 200, "body": row_to_dict(row)}
 
@@ -7037,6 +7069,15 @@ def dispatch(method, path, params, body, conn):
             conn.execute("UPDATE order_items SET status='F' WHERE id=? AND status NOT IN ('F','dispatched')", [item["id"]])
         # Sync order status from items (will compute F since all items are F)
         sync_order_status(conn, oid)
+        update_kanban_statuses(conn, oid)
+        # Auto-create delivery_log entry so dispatch board can see stock-complete orders
+        existing_dl = conn.execute("SELECT id FROM delivery_log WHERE order_id=?", [oid]).fetchone()
+        if not existing_dl:
+            conn.execute(
+                "INSERT INTO delivery_log (order_id, status, delivery_type, notes, created_at) VALUES (?, 'pending', 'delivery', 'Auto-created: stock run completed', CURRENT_TIMESTAMP)",
+                [oid]
+            )
+            conn.commit()
         return {"status": 200, "body": order_full(conn, oid)}
 
     # ----- CAPACITY CHECK (pre-drop validation) -----
@@ -7555,15 +7596,16 @@ def dispatch(method, path, params, body, conn):
             return {"status": 400, "body": {"error": "truck_id required"}}
         # Validate mandatory checklist items
         mandatory_items = conn.execute("SELECT id, item_text FROM safety_checklist_items WHERE is_mandatory=1 AND is_active=1").fetchall()
-        mandatory_ids = {r[0] for r in mandatory_items}
+        # Coerce all IDs to strings for safe comparison (frontend may send int or string)
+        mandatory_ids = {str(r[0]) for r in mandatory_items}
         checked_ids = set()
         if isinstance(safety_checks, list):
             for item in safety_checks:
                 if isinstance(item, dict) and item.get("checked"):
-                    checked_ids.add(item.get("item_id"))
+                    checked_ids.add(str(item.get("item_id", "")))
         missing = mandatory_ids - checked_ids
         if missing and mandatory_items:
-            return {"status": 400, "body": {"error": "All mandatory safety checks must be completed", "missing_count": len(missing)}}
+            return {"status": 400, "body": {"error": "All mandatory safety checks must be completed", "missing_count": len(missing), "mandatory_ids": list(mandatory_ids), "checked_ids": list(checked_ids)}}
         # Check no active shift
         active = conn.execute(
             "SELECT id FROM driver_shifts WHERE driver_id=? AND status='active'",
@@ -7848,9 +7890,15 @@ def dispatch(method, path, params, body, conn):
         if new_status in ("delivered", "collected"):
             dl_row = conn.execute("SELECT order_id FROM delivery_log WHERE id=?", [dl_id]).fetchone()
             if dl_row and dl_row[0]:
+                order_id_dl = dl_row[0]
                 conn.execute("UPDATE orders SET status=?, dispatched_at=? WHERE id=?",
-                             [new_status, datetime.now(timezone.utc).isoformat(), dl_row[0]])
-        conn.commit()
+                             [new_status, datetime.now(timezone.utc).isoformat(), order_id_dl])
+                conn.execute("UPDATE order_items SET status=? WHERE order_id=? AND status IN ('F','dispatched')",
+                             [new_status, order_id_dl])
+                conn.commit()
+                update_kanban_statuses(conn, order_id_dl)
+        else:
+            conn.commit()
         return {"status": 200, "body": {"ok": True}}
 
     # ----- COMPLETE DELIVERY (triggers cost calc) -----

@@ -819,16 +819,38 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
     }
   },[pallets]);
 
-  const loggingRef = React.useRef(false);
-  const logQuantity = async(delta)=>{
-    if (!sessionId || loggingRef.current) return;
-    loggingRef.current = true;
-    const newCount = Math.max(0, pallets+delta);
-    setPallets(newCount);
+  // Queue-based counter: immediate UI update, debounced API sync to prevent counter jumps
+  const pendingDeltaRef = React.useRef(0);
+  const syncTimerRef = React.useRef(null);
+  const syncingRef = React.useRef(false);
+
+  const flushDelta = React.useCallback(async()=>{
+    if (syncingRef.current || pendingDeltaRef.current === 0 || !sessionId) return;
+    syncingRef.current = true;
+    const delta = pendingDeltaRef.current;
+    pendingDeltaRef.current = 0;
     try {
       await api(`/production/sessions/${sessionId}/log`,{method:'PUT',body:JSON.stringify({quantity_change:delta})},token);
-    } catch(e){ setPallets(prev => Math.max(0, prev - delta)); toast('Failed to log quantity','error'); }
-    finally { loggingRef.current = false; }
+    } catch(e){
+      // Revert the UI by the amount that failed
+      setPallets(prev => Math.max(0, prev - delta));
+      toast('Failed to log quantity','error');
+    } finally {
+      syncingRef.current = false;
+      // If more deltas accumulated while syncing, flush again
+      if (pendingDeltaRef.current !== 0) {
+        syncTimerRef.current = setTimeout(flushDelta, 300);
+      }
+    }
+  },[sessionId, token]);
+
+  const logQuantity = (delta)=>{
+    if (!sessionId) return;
+    setPallets(prev => Math.max(0, prev + delta));
+    pendingDeltaRef.current += delta;
+    // Debounce: wait 400ms for rapid clicks to batch together
+    if (syncTimerRef.current) clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = setTimeout(flushDelta, 400);
   };
 
   const toggleSubAssembly = async()=>{
@@ -1559,7 +1581,7 @@ const App = () => {
       <SetupTimerScreen
         token={token} user={user} zone={zone} station={station}
         sessionStart={sessionStart} setupInfo={jobInfo||{}}
-        onFinishSetup={()=>setScreen('home')}
+        onFinishSetup={()=>setScreen('active_job')}
         onStartJobFromSetup={()=>{ setJobInfo({...jobInfo,sessionId:null}); setScreen('active_job'); }}
         onLogout={handleLogout}
       />
