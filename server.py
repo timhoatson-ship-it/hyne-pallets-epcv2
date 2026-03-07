@@ -2760,6 +2760,10 @@ def migrate_db():
     except Exception:
         pass
 
+    # Fix: auto-verify any existing stock run orders that were created with is_verified=0
+    conn.execute("UPDATE orders SET is_verified=1, verified_at=CURRENT_TIMESTAMP WHERE is_stock_run=1 AND is_verified=0")
+    conn.commit()
+
     conn.close()
 
 
@@ -3714,10 +3718,20 @@ def dispatch(method, path, params, body, conn):
         # client_id required unless stock run
         if not body.get("client_id") and not body.get("is_stock_run"):
             return {"status": 400, "body": {"error": "Field 'client_id' is required"}}
+        # Stock runs are auto-verified (no MYOB import, user creates manually)
+        is_stock = body.get("is_stock_run", 0)
+        is_verified = 1 if is_stock else int(body.get("is_verified", 0))
+        verified_by = current_user["id"] if is_verified else None
+        verified_at = "CURRENT_TIMESTAMP" if is_verified else None
         try:
-            cur = conn.execute("INSERT INTO orders (order_number, client_id, status, special_instructions, delivery_type, notes, requested_delivery_date, is_stock_run) VALUES (?,?,?,?,?,?,?,?)",
-                [body["order_number"], body.get("client_id"), body.get("status", "T"), body.get("special_instructions"), body.get("delivery_type", "delivery"), body.get("notes"),
-                 body.get("requested_delivery_date"), body.get("is_stock_run", 0)])
+            if is_verified:
+                cur = conn.execute("INSERT INTO orders (order_number, client_id, status, special_instructions, delivery_type, notes, requested_delivery_date, is_stock_run, is_verified, verified_by, verified_at) VALUES (?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                    [body["order_number"], body.get("client_id"), body.get("status", "T"), body.get("special_instructions"), body.get("delivery_type", "delivery"), body.get("notes"),
+                     body.get("requested_delivery_date"), is_stock, 1, verified_by])
+            else:
+                cur = conn.execute("INSERT INTO orders (order_number, client_id, status, special_instructions, delivery_type, notes, requested_delivery_date, is_stock_run, is_verified) VALUES (?,?,?,?,?,?,?,?,?)",
+                    [body["order_number"], body.get("client_id"), body.get("status", "T"), body.get("special_instructions"), body.get("delivery_type", "delivery"), body.get("notes"),
+                     body.get("requested_delivery_date"), is_stock, 0])
             conn.commit()
             log_audit(conn, current_user["id"], "create_order", "orders", cur.lastrowid, None, body)
             order = order_full(conn, cur.lastrowid)
