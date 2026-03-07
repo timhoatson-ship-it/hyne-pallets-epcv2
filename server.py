@@ -14,6 +14,7 @@ import re
 import sqlite3
 import hmac
 import time
+import jwt as pyjwt  # PyJWT — industry-standard JWT library (replaces hand-rolled HMAC tokens)
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -54,17 +55,32 @@ def get_connection():
 
 
 def hash_password(password):
-    """Hash password using werkzeug's PBKDF2 (with per-user salt + work factor)."""
+    """Hash password using werkzeug's PBKDF2 (industry standard, with per-user salt).
+
+    All new accounts and password changes use this method.
+    """
     from werkzeug.security import generate_password_hash
     return generate_password_hash(password, method='pbkdf2:sha256', salt_length=16)
 
 
 def check_password(stored_hash, password):
-    """Verify password against stored hash. Supports both new werkzeug and legacy SHA256."""
+    """Verify password against stored hash.
+
+    Supports two formats:
+    1. PBKDF2 (preferred) — hashes starting with 'pbkdf2:' are verified via werkzeug.
+    2. Legacy SHA256 (DEPRECATED) — old hashes from before the PBKDF2 migration are
+       checked via plain SHA256 + static salt. On successful login, the caller
+       (see /auth/login) auto-upgrades the hash to PBKDF2.
+
+    TODO: Once all accounts have logged in at least once after the PBKDF2 migration,
+          remove the legacy SHA256 fallback below and force a password reset for any
+          remaining legacy hashes.
+    """
     from werkzeug.security import check_password_hash
     if stored_hash and stored_hash.startswith("pbkdf2:"):
         return check_password_hash(stored_hash, password)
-    # Legacy SHA256 fallback for existing accounts
+    # DEPRECATED: Legacy SHA256 fallback — kept temporarily for accounts that haven't
+    # logged in since the PBKDF2 migration. Will be removed in a future release.
     legacy = hashlib.sha256((password + "hyne_salt").encode()).hexdigest()
     return stored_hash == legacy
 
@@ -80,7 +96,11 @@ def rows_to_list(rows):
 
 
 def send_email_smtp(to_email, subject, body_text, body_html=None):
-    """Send an email via SMTP. Returns (success: bool, error_msg: str or None)."""
+    """Send an email via SMTP. Returns (success: bool, error_msg: str or None).
+
+    SMTP password is read from the SMTP_PASSWORD environment variable (not the DB).
+    Host/port/user/TLS settings are still read from the email_config DB table.
+    """
     import smtplib
     from email.mime.text import MIMEText
     from email.mime.multipart import MIMEMultipart
@@ -96,6 +116,11 @@ def send_email_smtp(to_email, subject, body_text, body_html=None):
         if not cfg.get("smtp_host") or not cfg.get("smtp_user"):
             return (False, "SMTP host and user are required")
 
+        # SMTP password comes from env var, not from DB
+        smtp_pw = os.environ.get("SMTP_PASSWORD", "")
+        if not smtp_pw:
+            return (False, "SMTP_PASSWORD environment variable is not set")
+
         msg = MIMEMultipart("alternative")
         msg["From"] = f"{cfg.get('from_name', 'Hyne Pallets')} <{cfg.get('from_email', cfg['smtp_user'])}>"
         msg["To"] = to_email
@@ -108,7 +133,7 @@ def send_email_smtp(to_email, subject, body_text, body_html=None):
         server = smtplib.SMTP(cfg["smtp_host"], int(cfg.get("smtp_port", 587)))
         if cfg.get("smtp_use_tls", 1):
             server.starttls()
-        server.login(cfg["smtp_user"], _smtp_decrypt(cfg.get("smtp_password", "")))
+        server.login(cfg["smtp_user"], smtp_pw)
         server.send_message(msg)
         server.quit()
         return (True, None)
@@ -2558,75 +2583,82 @@ def migrate_db():
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 if not JWT_SECRET:
-    print("\n[WARNING] JWT_SECRET environment variable is not set.")
-    print("Set JWT_SECRET in your environment before starting the server.")
-    print("Example: export JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))')\n")
-    # Use a fallback so the server can still start (login will fail without a real secret)
     import sys
-    print("\n[FATAL] JWT_SECRET environment variable is not set. Server cannot start securely.")
-    print("Set JWT_SECRET in your environment before starting the server.")
-    print("Example: export JWT_SECRET=$(python3 -c 'import secrets; print(secrets.token_hex(32))')\n")
+    print("\n[FATAL] JWT_SECRET environment variable is not set. Server cannot start.")
+    print("Set it in Railway Variables or your local environment.")
+    print("Generate one with: python3 -c 'import secrets; print(secrets.token_hex(32))'")
+    print("See SECURITY_SETUP.md for full instructions.\n")
     sys.exit(1)
 JWT_EXPIRY_SECONDS = 86400 * 7  # 7 days
 
-def _smtp_encrypt(plaintext):
-    """Simple XOR obfuscation with JWT_SECRET — not true encryption but prevents casual DB reads."""
-    if not plaintext:
-        return ""
-    key = (JWT_SECRET or "fallback").encode()
-    encrypted = bytearray()
-    for i, ch in enumerate(plaintext.encode()):
-        encrypted.append(ch ^ key[i % len(key)])
-    import base64
-    return "ENC:" + base64.b64encode(bytes(encrypted)).decode()
-
-def _smtp_decrypt(stored):
-    """Reverse the XOR obfuscation."""
-    if not stored or not stored.startswith("ENC:"):
-        return stored  # Legacy plaintext — return as-is
-    import base64
-    key = (JWT_SECRET or "fallback").encode()
-    encrypted = base64.b64decode(stored[4:])
-    decrypted = bytearray()
-    for i, ch in enumerate(encrypted):
-        decrypted.append(ch ^ key[i % len(key)])
-    return decrypted.decode()
+# ---------------------------------------------------------------------------
+# SMTP credentials — read from environment variables, NOT the database.
+# The old XOR "encryption" (_smtp_encrypt/_smtp_decrypt) has been removed
+# because XOR with a known key is not real security. SMTP password now lives
+# solely in the SMTP_PASSWORD env var (set in Railway Variables).
+# ---------------------------------------------------------------------------
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 
 
-
+# ---------------------------------------------------------------------------
+# JWT Token helpers — uses PyJWT (industry-standard library).
+#
+# How it works:
+# - make_token() creates a signed token containing the user's ID and role.
+# - decode_token() verifies the signature and checks the expiry date.
+# - PyJWT handles all the base64/HMAC/JSON plumbing that was previously
+#   done by hand. This is safer because PyJWT is battle-tested by millions
+#   of apps and handles edge cases (padding, timing attacks, algorithm
+#   confusion) that hand-rolled code typically misses.
+# - The token format is a standard JWT, so it works with any JWT debugger
+#   (e.g. jwt.io) and any client library.
+# ---------------------------------------------------------------------------
 
 def make_token(user_id, role):
-    """Create HMAC-signed JWT token."""
-    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
-    payload_data = {"user_id": user_id, "role": role, "exp": int(time.time()) + JWT_EXPIRY_SECONDS, "iat": int(time.time())}
-    payload = base64.urlsafe_b64encode(json.dumps(payload_data).encode()).decode().rstrip("=")
-    signature = hmac.new(JWT_SECRET.encode(), f"{header}.{payload}".encode(), hashlib.sha256).hexdigest()
-    return f"{header}.{payload}.{signature}"
+    """Create a signed JWT token for the given user.
+
+    Returns a standard HS256-signed JWT string containing:
+      - sub (subject): the user ID
+      - role: the user's role string
+      - iat (issued at): current time
+      - exp (expires): current time + JWT_EXPIRY_SECONDS (7 days)
+    """
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,           # Standard claim: who this token is for
+        "user_id": user_id,       # Keep for backward compat with existing code
+        "role": role,
+        "iat": now,               # When the token was issued
+        "exp": now + timedelta(seconds=JWT_EXPIRY_SECONDS),  # When it expires
+    }
+    return pyjwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
 def decode_token(token):
-    """Verify HMAC signature and decode JWT token. Returns payload dict or None."""
+    """Verify and decode a JWT token. Returns the payload dict or None.
+
+    PyJWT automatically checks:
+      - The HMAC-SHA256 signature matches (tamper protection)
+      - The 'exp' claim hasn't passed (expiry check)
+      - The token is well-formed JSON
+    If any check fails, we return None (invalid token).
+    """
     try:
-        parts = token.split(".")
-        if len(parts) != 3:
-            return None
-        header_b64, payload_b64, sig = parts
-        # Verify signature
-        expected_sig = hmac.new(JWT_SECRET.encode(), f"{header_b64}.{payload_b64}".encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected_sig):
-            return None
-        # Decode payload (add padding)
-        payload_b64 += "=" * (4 - len(payload_b64) % 4)
-        payload_data = json.loads(base64.urlsafe_b64decode(payload_b64.encode()).decode())
-        # Check expiry
-        if payload_data.get("exp", 0) < int(time.time()):
-            return None
-        return payload_data
-    except Exception:
-        return None
+        payload = pyjwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=["HS256"],   # Only accept HS256 — prevents algorithm confusion attacks
+            options={"require": ["exp", "iat", "sub"]}  # Reject tokens missing these claims
+        )
+        return payload
+    except pyjwt.ExpiredSignatureError:
+        return None  # Token has expired — user needs to log in again
+    except pyjwt.InvalidTokenError:
+        return None  # Bad signature, malformed, or missing required claims
 
 
 def get_current_user(conn):
+    """Extract and validate the Bearer token from the request, return the user dict or None."""
     auth = request.headers.get("Authorization", "")
     token = None
     if auth.startswith("Bearer "):
@@ -2642,6 +2674,7 @@ def get_current_user(conn):
 
 
 def require_auth(conn):
+    """Convenience wrapper — returns user dict or None if not authenticated."""
     user = get_current_user(conn)
     if not user:
         return None
@@ -8492,6 +8525,9 @@ def dispatch(method, path, params, body, conn):
         return {"status": 200, "body": {"synced": len([r for r in results if r["status"] == "ok"]), "failed": len([r for r in results if r["status"] == "error"]), "results": results}}
 
     # ----- EMAIL CONFIG -----
+    # NOTE: SMTP password is no longer stored in the database. It must be set
+    # as the SMTP_PASSWORD environment variable in Railway. The admin UI can
+    # still configure host/port/user/TLS/from-name/from-email in the DB.
     if method == "GET" and path == "/admin/email-config":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
@@ -8500,8 +8536,8 @@ def dispatch(method, path, params, body, conn):
         row = conn.execute("SELECT * FROM email_config LIMIT 1").fetchone()
         if row:
             cfg = row_to_dict(row)
-            if cfg.get("smtp_password"):
-                cfg["smtp_password"] = "****"
+            # Never return actual SMTP password — show status of env var instead
+            cfg["smtp_password"] = "(set via SMTP_PASSWORD env var)" if os.environ.get("SMTP_PASSWORD") else "(NOT SET — add SMTP_PASSWORD to Railway Variables)"
             return {"status": 200, "body": cfg}
         return {"status": 200, "body": {"is_active": 0}}
 
@@ -8509,14 +8545,14 @@ def dispatch(method, path, params, body, conn):
         if not current_user or current_user["role"] not in ("executive", "office"):
             return {"status": 403, "body": {"error": "Admin access required"}}
         row = conn.execute("SELECT id FROM email_config LIMIT 1").fetchone()
+        # Only allow saving non-secret fields — password lives in env var only
+        safe_fields = ["smtp_host", "smtp_port", "smtp_user", "smtp_use_tls", "from_name", "from_email", "is_active"]
         if row:
-            fields = ["smtp_host", "smtp_port", "smtp_user", "smtp_password", "smtp_use_tls", "from_name", "from_email", "is_active"]
             updates, vals = [], []
-            for f in fields:
+            for f in safe_fields:
                 if f in body:
                     updates.append(f"{f}=?")
-                    val = _smtp_encrypt(body[f]) if f == "smtp_password" else body[f]
-                    vals.append(val)
+                    vals.append(body[f])
             if updates:
                 vals.append(datetime.now(timezone.utc).isoformat())
                 vals.append(row[0])
@@ -8524,13 +8560,12 @@ def dispatch(method, path, params, body, conn):
                 conn.commit()
         else:
             conn.execute("INSERT INTO email_config (smtp_host, smtp_port, smtp_user, smtp_password, smtp_use_tls, from_name, from_email, is_active) VALUES (?,?,?,?,?,?,?,?)",
-                [body.get("smtp_host",""), body.get("smtp_port",587), body.get("smtp_user",""), _smtp_encrypt(body.get("smtp_password","")),
+                [body.get("smtp_host",""), body.get("smtp_port",587), body.get("smtp_user",""), "",
                  body.get("smtp_use_tls",1), body.get("from_name","Hyne Pallets"), body.get("from_email",""), body.get("is_active",0)])
             conn.commit()
         row = conn.execute("SELECT * FROM email_config LIMIT 1").fetchone()
         cfg = row_to_dict(row)
-        if cfg.get("smtp_password"):
-            cfg["smtp_password"] = "****"
+        cfg["smtp_password"] = "(set via SMTP_PASSWORD env var)" if os.environ.get("SMTP_PASSWORD") else "(NOT SET)"
         return {"status": 200, "body": cfg}
 
     if method == "POST" and path == "/admin/purge-data":

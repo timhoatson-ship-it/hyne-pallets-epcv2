@@ -10741,15 +10741,15 @@ const App = () => {
     // Redirect floor workers to production, prod managers to station allocation
     if (u.role === 'floor_worker' || u.role === 'team_leader') {
       setPage('floor');
-      setSidebarCollapsed(true);
+      if (window.innerWidth <= 768) setSidebarCollapsed(true);
     } else if (u.role === 'production_manager') {
       setPage('allocation');
     } else if (u.role === 'yardsman') {
       setPage('receiving');
-      setSidebarCollapsed(true);
+      if (window.innerWidth <= 768) setSidebarCollapsed(true);
     } else if (u.role === 'chainsaw_operator') {
       setPage('chainsaw');
-      setSidebarCollapsed(true);
+      if (window.innerWidth <= 768) setSidebarCollapsed(true);
     } else {
       setPage('dashboard');
     }
@@ -10766,8 +10766,7 @@ const App = () => {
 
   const handleNav = (p) => {
     setPage(p);
-    if (['floor','chainsaw','receiving'].includes(p)) setSidebarCollapsed(true);
-    else if (window.innerWidth <= 768) setSidebarCollapsed(true);
+    if (window.innerWidth <= 768) setSidebarCollapsed(true);
     else setSidebarCollapsed(false);
   };
 
