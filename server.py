@@ -521,7 +521,7 @@ CREATE TABLE IF NOT EXISTS schedule_entries (
     scheduled_date TEXT NOT NULL,
     shift_id INTEGER REFERENCES shifts(id),
     planned_quantity INTEGER,
-    status TEXT DEFAULT 'planned' CHECK(status IN ('planned','in_progress','completed','cancelled')),
+    status TEXT DEFAULT 'planned' CHECK(status IN ('planned','in_progress','completed','partial_complete','cancelled')),
     priority INTEGER DEFAULT 0,
     run_order INTEGER DEFAULT 0,
     notes TEXT,
@@ -1265,6 +1265,41 @@ def migrate_db():
         c.execute("ALTER TABLE schedule_entries ADD COLUMN run_order INTEGER DEFAULT 0")
     if 'planned_station_id' not in se_cols:
         c.execute("ALTER TABLE schedule_entries ADD COLUMN planned_station_id INTEGER")
+    # Fix CHECK constraint on schedule_entries.status to allow 'partial_complete'
+    try:
+        se_sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='schedule_entries'").fetchone()
+        if se_sql and 'partial_complete' not in (se_sql[0] or ''):
+            c.execute("PRAGMA foreign_keys=OFF")
+            c.execute("""CREATE TABLE schedule_entries_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER REFERENCES orders(id),
+                order_item_id INTEGER REFERENCES order_items(id),
+                zone_id INTEGER NOT NULL REFERENCES zones(id),
+                station_id INTEGER REFERENCES stations(id),
+                planned_station_id INTEGER REFERENCES stations(id),
+                scheduled_date TEXT NOT NULL,
+                shift_id INTEGER REFERENCES shifts(id),
+                planned_quantity INTEGER,
+                status TEXT DEFAULT 'planned' CHECK(status IN ('planned','in_progress','completed','partial_complete','cancelled')),
+                priority INTEGER DEFAULT 0,
+                run_order INTEGER DEFAULT 0,
+                notes TEXT,
+                created_by INTEGER REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            c.execute("""INSERT INTO schedule_entries_new
+                SELECT id, order_id, order_item_id, zone_id, station_id, planned_station_id,
+                       scheduled_date, shift_id, planned_quantity, status, priority, run_order,
+                       notes, created_by, created_at, updated_at
+                FROM schedule_entries""")
+            c.execute("DROP TABLE schedule_entries")
+            c.execute("ALTER TABLE schedule_entries_new RENAME TO schedule_entries")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_schedule_entries_item ON schedule_entries(order_item_id)")
+            c.execute("PRAGMA foreign_keys=ON")
+            conn.commit()
+    except Exception:
+        pass
     # Add new columns to order_items
     oi_cols = {row[1] for row in c.execute("PRAGMA table_info(order_items)").fetchall()}
     if 'split_from_item_id' not in oi_cols:
@@ -1279,6 +1314,10 @@ def migrate_db():
         c.execute("ALTER TABLE order_items ADD COLUMN docking_completed_at TIMESTAMP")
     try:
         c.execute("ALTER TABLE order_items ADD COLUMN cut_list_issued INTEGER DEFAULT 0")
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE order_items ADD COLUMN cut_list_issued_at TIMESTAMP")
     except Exception:
         pass
     if 'requested_delivery_date' not in oi_cols:
@@ -3732,23 +3771,27 @@ def dispatch(method, path, params, body, conn):
         base_q = """
             SELECT oi.*, o.order_number, o.client_id, c.company_name as client_name,
                    s.name as sku_name, z.name as zone_name, z.code as zone_code,
-                   se.scheduled_date, se.station_id as sched_station_id
+                   se.scheduled_date as sched_date, se.station_id as sched_station_id
             FROM order_items oi
             JOIN orders o ON o.id = oi.order_id
             LEFT JOIN clients c ON c.id = o.client_id
             LEFT JOIN skus s ON s.id = oi.sku_id
             LEFT JOIN zones z ON z.id = oi.zone_id
-            LEFT JOIN schedule_entries se ON se.order_item_id = oi.id
+            LEFT JOIN schedule_entries se ON se.id = (
+                SELECT se2.id FROM schedule_entries se2
+                WHERE se2.order_item_id = oi.id
+                ORDER BY se2.scheduled_date DESC, se2.id DESC LIMIT 1
+            )
         """
 
-        # Docking Required: status='C', has schedule entry, cut_list_issued=0
-        q1 = base_q + " WHERE oi.status='C' AND se.id IS NOT NULL AND oi.cut_list_issued=0"
+        # Docking Required: status='T', has schedule entry (scheduled but not yet cut-listed)
+        q1 = base_q + " WHERE oi.status='T' AND se.id IS NOT NULL"
         if zone_filter:
             q1 += " AND oi.zone_id=?"
             params_q1 = [int(zone_filter)]
         else:
             params_q1 = []
-        q1 += " ORDER BY se.scheduled_date ASC, o.order_number"
+        q1 += " ORDER BY sched_date ASC, o.order_number"
         docking_required = rows_to_list(conn.execute(q1, params_q1).fetchall())
 
         # Cut List Issued: status='C', cut_list_issued=1
@@ -3758,7 +3801,7 @@ def dispatch(method, path, params, body, conn):
             params_q2 = [int(zone_filter)]
         else:
             params_q2 = []
-        q2 += " ORDER BY se.scheduled_date ASC, o.order_number"
+        q2 += " ORDER BY sched_date ASC, o.order_number"
         cut_list_issued = rows_to_list(conn.execute(q2, params_q2).fetchall())
 
         # Docking Complete: status='R' (recently completed)
@@ -4054,6 +4097,11 @@ def dispatch(method, path, params, body, conn):
                 [iid]
             )
         conn.commit()
+        # Sync parent order status from item statuses
+        try:
+            sync_order_status(conn, row["order_id"])
+        except Exception:
+            pass
         # Update kanban statuses for the parent order
         try:
             update_kanban_statuses(conn, row["order_id"])
@@ -4128,9 +4176,9 @@ def dispatch(method, path, params, body, conn):
                 cur = conn.execute("INSERT INTO schedule_entries (order_id, order_item_id, zone_id, planned_station_id, scheduled_date, planned_quantity, notes, created_by) VALUES (?,?,?,?,?,?,?,?)",
                     [oid, order_item_id, body["zone_id"], body.get("planned_station_id"), body["scheduled_date"],
                      body.get("planned_quantity") or item["quantity"], body.get("notes"), current_user["id"]])
-                # Update item schedule info — promote T→C (docking) but NOT to R
-                # Docking (C→R) is a manual gate — planner/prod manager must release
-                conn.execute("UPDATE order_items SET status=CASE WHEN status='T' THEN 'C' ELSE status END, scheduled_date=? WHERE id=? AND status IN ('T','C')",
+                # Update item schedule info — save scheduled_date only, do NOT promote T→C
+                # T→C is a manual planner action via 'Advance stage' dropdown or Docking Board 'Send it'
+                conn.execute("UPDATE order_items SET scheduled_date=? WHERE id=? AND status IN ('T','C')",
                     [body["scheduled_date"], order_item_id])
                 conn.commit()
                 # Sync order status from items (replaces direct status='C' set)
@@ -4160,9 +4208,9 @@ def dispatch(method, path, params, body, conn):
                 cur = conn.execute("INSERT INTO schedule_entries (order_id, order_item_id, zone_id, planned_station_id, scheduled_date, shift_id, planned_quantity, notes, created_by) VALUES (?,?,?,?,?,?,?,?,?)",
                     [order_id, item["id"], body["zone_id"], body.get("planned_station_id"), body["scheduled_date"], body.get("shift_id"), item["quantity"] or body.get("planned_quantity"), body.get("notes"), current_user["id"]])
                 created_entries.append(cur.lastrowid)
-                # Update item schedule info — promote T→C (docking) but NOT to R
-                # Docking (C→R) is a manual gate — planner/prod manager must release
-                conn.execute("UPDATE order_items SET status=CASE WHEN status='T' THEN 'C' ELSE status END, scheduled_date=? WHERE id=? AND status IN ('T','C')",
+                # Update item schedule info — save scheduled_date only, do NOT promote T→C
+                # T→C is a manual planner action via 'Advance stage' dropdown or Docking Board 'Send it'
+                conn.execute("UPDATE order_items SET scheduled_date=? WHERE id=? AND status IN ('T','C')",
                     [body["scheduled_date"], item["id"]])
             conn.commit()
             # Sync order status from items (replaces direct status='C' set)
@@ -4260,6 +4308,31 @@ def dispatch(method, path, params, body, conn):
         updated = conn.execute("SELECT se.*, o.eta_date, o.previous_eta, o.is_stock_run FROM schedule_entries se LEFT JOIN orders o ON o.id=se.order_id WHERE se.id=?", [sid]).fetchone()
         return {"status": 200, "body": row_to_dict(updated)}
 
+    # ----- REPLAN: Create new schedule entry for remaining qty after partial completion -----
+    m = match("/schedule/:id/replan", path)
+    if m and method == "POST":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        sid = int(m["id"])
+        entry = conn.execute("SELECT se.*, oi.quantity as item_quantity, oi.produced_quantity FROM schedule_entries se JOIN order_items oi ON oi.id=se.order_item_id WHERE se.id=?", [sid]).fetchone()
+        if not entry:
+            return {"status": 404, "body": {"error": "Schedule entry not found"}}
+        remaining = (entry["item_quantity"] or 0) - (entry["produced_quantity"] or 0)
+        if remaining <= 0:
+            return {"status": 400, "body": {"error": "No remaining quantity to re-plan"}}
+        new_date = body.get("scheduled_date")  # optional — if not provided, leave unscheduled
+        # Mark the partial entry as completed
+        conn.execute("UPDATE schedule_entries SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=?", [sid])
+        # Create a new schedule entry for the remaining quantity
+        cur = conn.execute(
+            "INSERT INTO schedule_entries (order_id, order_item_id, zone_id, scheduled_date, planned_quantity, status) VALUES (?,?,?,?,?,?)",
+            [entry["order_id"], entry["order_item_id"], entry["zone_id"], new_date, remaining, 'planned']
+        )
+        conn.commit()
+        log_audit(conn, current_user["id"], "replan_partial", "schedule_entries", cur.lastrowid)
+        new_row = conn.execute("SELECT * FROM schedule_entries WHERE id=?", [cur.lastrowid]).fetchone()
+        return {"status": 201, "body": row_to_dict(new_row)}
+
     # ----- PRODUCTION FLOOR OVERVIEW -----
     if method == "GET" and path == "/production/floor-overview":
         if not current_user:
@@ -4350,14 +4423,16 @@ def dispatch(method, path, params, body, conn):
             conn.commit()
             conn.execute("INSERT INTO session_workers (session_id, user_id) VALUES (?,?)", [session_id, current_user["id"]])
             conn.commit()
-            # Promote item status R→P and sync order status
+            # Promote item status to P (Production) when floor worker starts and sync kanban
             order_item_id = body.get("order_item_id")
             if order_item_id:
                 item_row = conn.execute("SELECT * FROM order_items WHERE id=?", [order_item_id]).fetchone()
-                if item_row and item_row["status"] == 'R':
+                if item_row and item_row["status"] in ('T', 'C', 'R'):
                     conn.execute("UPDATE order_items SET status='P' WHERE id=?", [order_item_id])
                     conn.commit()
                     sync_order_status(conn, item_row["order_id"])
+                    update_kanban_statuses(conn, item_row["order_id"])
+                    conn.commit()
             # Auto-start: update schedule_entries from 'planned' → 'in_progress' when floor worker starts
             if order_item_id:
                 se_planned = conn.execute(
@@ -4474,9 +4549,13 @@ def dispatch(method, path, params, body, conn):
                 [session["order_item_id"]]
             ).fetchone()
             if se_row:
+                item_for_se = conn.execute("SELECT quantity, produced_quantity FROM order_items WHERE id=?", [session["order_item_id"]]).fetchone()
+                se_status = 'completed'
+                if item_for_se and item_for_se["produced_quantity"] < item_for_se["quantity"]:
+                    se_status = 'partial_complete'
                 conn.execute(
-                    "UPDATE schedule_entries SET status='completed', updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                    [se_row["id"]]
+                    "UPDATE schedule_entries SET status=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    [se_status, se_row["id"]]
                 )
             
             # --- Refresh kanban status cache for this order ---
@@ -4684,7 +4763,7 @@ def dispatch(method, path, params, body, conn):
             return {"status": 404, "body": {"error": "Inspection not found"}}
         conn.execute("UPDATE qa_inspections SET passed=1, inspector_id=?, inspected_at=CURRENT_TIMESTAMP WHERE id=?", [current_user["id"], iid])
         conn.commit()
-        # QA approval is the gate: promote item P→F and sync order status
+        # QA approval is the gate: promote item P→F, sync order status, and update inventory
         if insp["order_item_id"]:
             item = conn.execute("SELECT * FROM order_items WHERE id=?", [insp["order_item_id"]]).fetchone()
             if item and item["status"] not in ('F', 'dispatched'):
@@ -4692,6 +4771,16 @@ def dispatch(method, path, params, body, conn):
                 conn.commit()
                 sync_order_status(conn, item["order_id"])
                 update_kanban_statuses(conn, item["order_id"])
+                # --- Add produced quantity to inventory stock on hand ---
+                produced_qty = item["produced_quantity"] or 0
+                if produced_qty > 0 and item["sku_id"]:
+                    existing_inv = conn.execute("SELECT id FROM inventory WHERE sku_id=?", [item["sku_id"]]).fetchone()
+                    if existing_inv:
+                        conn.execute("UPDATE inventory SET units_on_hand = units_on_hand + ?, updated_at=CURRENT_TIMESTAMP WHERE sku_id=?",
+                            [produced_qty, item["sku_id"]])
+                    else:
+                        conn.execute("INSERT INTO inventory (sku_id, units_on_hand, units_allocated) VALUES (?,?,0)",
+                            [item["sku_id"], produced_qty])
                 conn.commit()
         row = conn.execute("SELECT * FROM qa_inspections WHERE id=?", [iid]).fetchone()
         return {"status": 200, "body": row_to_dict(row)}
