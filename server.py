@@ -639,6 +639,18 @@ CREATE TABLE IF NOT EXISTS inventory (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS inventory_movements (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sku_id INTEGER NOT NULL REFERENCES skus(id),
+    movement_type TEXT NOT NULL CHECK(movement_type IN ('production_in','dispatch_out','manual_adjust','allocation','deallocation','qa_approved')),
+    quantity INTEGER NOT NULL,
+    reference_type TEXT,
+    reference_id INTEGER,
+    notes TEXT,
+    user_id INTEGER REFERENCES users(id),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS station_capacity (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     station_id INTEGER NOT NULL REFERENCES stations(id),
@@ -2704,6 +2716,19 @@ def migrate_db():
             "CREATE INDEX IF NOT EXISTS idx_skus_code ON skus(code)",
             "CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id)",
             "CREATE INDEX IF NOT EXISTS idx_audit_log_user ON audit_log(user_id)",
+            """CREATE TABLE IF NOT EXISTS inventory_movements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sku_id INTEGER NOT NULL REFERENCES skus(id),
+                movement_type TEXT NOT NULL CHECK(movement_type IN ('production_in','dispatch_out','manual_adjust','allocation','deallocation','qa_approved')),
+                quantity INTEGER NOT NULL,
+                reference_type TEXT,
+                reference_id INTEGER,
+                notes TEXT,
+                user_id INTEGER REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_inv_movements_sku ON inventory_movements(sku_id)",
+            "CREATE INDEX IF NOT EXISTS idx_inv_movements_ref ON inventory_movements(reference_type, reference_id)",
             "CREATE INDEX IF NOT EXISTS idx_timber_packs_spec ON timber_packs(spec_id)",
             "CREATE INDEX IF NOT EXISTS idx_timber_packs_status ON timber_packs(status)",
             "CREATE INDEX IF NOT EXISTS idx_dispatch_runs_date ON dispatch_runs(run_date)",
@@ -2713,6 +2738,19 @@ def migrate_db():
         conn.commit()
     except Exception as e:
         logging.info("Index creation note: %s", e)
+
+    # P4 Issue 2: Add qa_sample_rate to SKUs for per-SKU QA intervals
+    try:
+        conn.execute("ALTER TABLE skus ADD COLUMN qa_sample_rate INTEGER DEFAULT NULL")
+        conn.commit()
+    except Exception:
+        pass
+    # Add qa_interval to zones if not exists
+    try:
+        conn.execute("ALTER TABLE zones ADD COLUMN qa_interval INTEGER DEFAULT 20")
+        conn.commit()
+    except Exception:
+        pass
 
     conn.close()
 
@@ -4944,6 +4982,11 @@ def dispatch(method, path, params, body, conn):
                     else:
                         conn.execute("INSERT INTO inventory (sku_id, units_on_hand, units_allocated) VALUES (?,?,0)",
                             [item["sku_id"], produced_qty])
+                    # P3/P4: Log inventory movement for traceability
+                    conn.execute(
+                        "INSERT INTO inventory_movements (sku_id, movement_type, quantity, reference_type, reference_id, notes, user_id) VALUES (?, 'qa_approved', ?, 'order_item', ?, 'QA approved - stock added', ?)",
+                        [item["sku_id"], produced_qty, insp["order_item_id"], current_user["id"] if current_user else None]
+                    )
                 conn.commit()
                 # Auto-create delivery_log when all items in order reach F (production complete)
                 pending_items = conn.execute(
@@ -6371,9 +6414,27 @@ def dispatch(method, path, params, body, conn):
             conn.execute("UPDATE orders SET status='dispatched', dispatched_at=CURRENT_TIMESTAMP WHERE id=? AND status NOT IN ('delivered','collected')", [oid])
             conn.execute("UPDATE order_items SET status='dispatched' WHERE order_id=? AND status='F'", [oid])
             update_kanban_statuses(conn, oid)
+            # P3 Issue 10: Decrement inventory on dispatch and log movements
+            dispatched_items = conn.execute(
+                "SELECT oi.sku_id, oi.quantity FROM order_items oi WHERE oi.order_id=? AND oi.status='dispatched' AND oi.sku_id IS NOT NULL",
+                [oid]
+            ).fetchall()
+            for di in dispatched_items:
+                di_sku = di["sku_id"] if isinstance(di, dict) else di[0]
+                di_qty = di["quantity"] if isinstance(di, dict) else di[1]
+                if di_sku and di_qty and di_qty > 0:
+                    conn.execute(
+                        "UPDATE inventory SET units_on_hand = MAX(0, units_on_hand - ?), updated_at=CURRENT_TIMESTAMP WHERE sku_id=?",
+                        [di_qty, di_sku]
+                    )
+                    conn.execute(
+                        "INSERT INTO inventory_movements (sku_id, movement_type, quantity, reference_type, reference_id, notes, user_id) VALUES (?, 'dispatch_out', ?, 'dispatch_run', ?, 'Auto-deducted on dispatch', ?)",
+                        [di_sku, -di_qty, run_id, current_user["id"] if current_user else None]
+                    )
         conn.commit()
         sse_notify("dispatch")
         sse_notify("orders")
+        sse_notify("inventory")
         return {"status": 200, "body": {"dispatched": True, "run_id": run_id}}
 
     # ----- DELIVERY CONFIRMED (driver confirms) -----
@@ -6927,17 +6988,82 @@ def dispatch(method, path, params, body, conn):
         row = conn.execute("SELECT * FROM notification_log WHERE id=?", [notif_id]).fetchone()
         return {"status": 201, "body": row_to_dict(row)}
 
+    # ----- QA CONFIG (P4 Issue 2) -----
+    if method == "GET" and path == "/qa-config":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        rows = conn.execute("""
+            SELECT s.id as sku_id, s.code as sku_code, s.name as sku_name, s.zone_id,
+                   s.qa_sample_rate, z.name as zone_name, z.qa_interval as zone_qa_interval
+            FROM skus s
+            LEFT JOIN zones z ON z.id=s.zone_id
+            WHERE s.is_active=1
+            ORDER BY z.name, s.code
+        """).fetchall()
+        return {"status": 200, "body": rows_to_list(rows)}
+
+    if method == "PUT" and path == "/qa-config":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        if current_user.get("role") not in ("executive", "office", "production_manager", "qa_lead"):
+            return {"status": 403, "body": {"error": "Insufficient permissions"}}
+        sku_rates = body.get("sku_rates", [])
+        zone_rates = body.get("zone_rates", [])
+        for sr in sku_rates:
+            rate = sr.get("qa_sample_rate")
+            if rate is not None and rate != "" and rate != "null":
+                rate = int(rate)
+            else:
+                rate = None
+            conn.execute("UPDATE skus SET qa_sample_rate=? WHERE id=?", [rate, int(sr["sku_id"])])
+        for zr in zone_rates:
+            interval = int(zr.get("qa_interval", 20))
+            conn.execute("UPDATE zones SET qa_interval=? WHERE id=?", [interval, int(zr["zone_id"])])
+        conn.commit()
+        log_audit(conn, current_user["id"] if current_user else None, "update_qa_config", "system", None, None, json.dumps(body))
+        return {"status": 200, "body": {"updated": True}}
+
+    # Per-SKU QA rate lookup (used by floor app)
+    m = match("/qa-rate/:sku_id", path)
+    if m and method == "GET":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        sku_id = int(m["sku_id"])
+        row = conn.execute("""
+            SELECT s.qa_sample_rate, z.qa_interval as zone_qa_interval
+            FROM skus s LEFT JOIN zones z ON z.id=s.zone_id
+            WHERE s.id=?
+        """, [sku_id]).fetchone()
+        if not row:
+            return {"status": 404, "body": {"error": "SKU not found"}}
+        sku_rate = row["qa_sample_rate"]
+        zone_rate = row["zone_qa_interval"]
+        effective = sku_rate if sku_rate is not None else (zone_rate or 20)
+        return {"status": 200, "body": {"sku_id": sku_id, "sku_rate": sku_rate, "zone_rate": zone_rate, "effective_rate": effective}}
+
     # ----- AUDIT LOG -----
     if method == "GET" and path == "/audit-log":
         if not current_user:
             return {"status": 401, "body": {"error": "Authentication required"}}
         where, vals = ["1=1"], []
         if params.get("entity_type"):
-            where.append("entity_type=?"); vals.append(params["entity_type"])
+            where.append("al.entity_type=?"); vals.append(params["entity_type"])
         if params.get("user_id"):
-            where.append("user_id=?"); vals.append(params["user_id"])
+            where.append("al.user_id=?"); vals.append(params["user_id"])
+        # P3 Issue 7: Text search across action, entity_type, entity_id, new_value, old_value + order_number cross-ref
+        search_q = params.get("search", "").strip()
+        if search_q:
+            search_like = f"%{search_q}%"
+            where.append("(al.action LIKE ? OR al.entity_type LIKE ? OR CAST(al.entity_id AS TEXT) LIKE ? OR al.new_value LIKE ? OR al.old_value LIKE ? OR al.details LIKE ? OR u.full_name LIKE ? OR EXISTS (SELECT 1 FROM orders o WHERE o.id=al.entity_id AND al.entity_type='orders' AND o.order_number LIKE ?))")
+            vals.extend([search_like] * 8)
+        # Date range filters
+        if params.get("date_from"):
+            where.append("al.created_at >= ?"); vals.append(params["date_from"])
+        if params.get("date_to"):
+            where.append("al.created_at <= ?"); vals.append(params["date_to"] + " 23:59:59")
         limit = safe_int(params.get("limit"), 100)
-        rows = conn.execute(f"SELECT al.*, u.full_name as user_name FROM audit_log al LEFT JOIN users u ON u.id=al.user_id WHERE {' AND '.join(where)} ORDER BY al.created_at DESC LIMIT ?", vals + [limit]).fetchall()
+        offset = safe_int(params.get("offset"), 0)
+        rows = conn.execute(f"SELECT al.*, u.full_name as user_name FROM audit_log al LEFT JOIN users u ON u.id=al.user_id WHERE {' AND '.join(where)} ORDER BY al.created_at DESC LIMIT ? OFFSET ?", vals + [limit, offset]).fetchall()
         return {"status": 200, "body": rows_to_list(rows)}
 
     # ----- INVENTORY -----
@@ -6979,6 +7105,66 @@ def dispatch(method, path, params, body, conn):
         conn.commit()
         row = conn.execute("SELECT inv.*, s.code as sku_code, s.name as sku_name FROM inventory inv JOIN skus s ON s.id=inv.sku_id WHERE inv.sku_id=?", [sku_id]).fetchone()
         return {"status": 200, "body": row_to_dict(row)}
+
+    # ----- INVENTORY MOVEMENTS LOG -----
+    if method == "GET" and path == "/inventory-movements":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        where, vals = ["1=1"], []
+        if params.get("sku_id"):
+            where.append("im.sku_id=?"); vals.append(int(params["sku_id"]))
+        if params.get("movement_type"):
+            where.append("im.movement_type=?"); vals.append(params["movement_type"])
+        if params.get("date_from"):
+            where.append("im.created_at >= ?"); vals.append(params["date_from"])
+        if params.get("date_to"):
+            where.append("im.created_at <= ?"); vals.append(params["date_to"] + " 23:59:59")
+        limit = safe_int(params.get("limit"), 100)
+        rows = conn.execute(f"""
+            SELECT im.*, s.code as sku_code, s.name as sku_name, u.full_name as user_name
+            FROM inventory_movements im
+            LEFT JOIN skus s ON s.id=im.sku_id
+            LEFT JOIN users u ON u.id=im.user_id
+            WHERE {' AND '.join(where)}
+            ORDER BY im.created_at DESC LIMIT ?
+        """, vals + [limit]).fetchall()
+        return {"status": 200, "body": rows_to_list(rows)}
+
+    # P4 Issue 8: Manual stock allocation endpoint
+    if method == "POST" and path == "/inventory/allocate-to-order":
+        if not current_user:
+            return {"status": 401, "body": {"error": "Authentication required"}}
+        if current_user.get("role") not in ("executive", "office", "planner", "production_manager"):
+            return {"status": 403, "body": {"error": "Insufficient permissions"}}
+        sku_id = body.get("sku_id")
+        order_item_id = body.get("order_item_id")
+        quantity = body.get("quantity")
+        if not sku_id or not order_item_id or not quantity:
+            return {"status": 400, "body": {"error": "sku_id, order_item_id, and quantity required"}}
+        quantity = int(quantity)
+        inv_row = conn.execute("SELECT units_on_hand, units_allocated FROM inventory WHERE sku_id=?", [sku_id]).fetchone()
+        if not inv_row:
+            return {"status": 400, "body": {"error": "No inventory record for this SKU"}}
+        on_hand = inv_row["units_on_hand"] if isinstance(inv_row, dict) else inv_row[0]
+        allocated = inv_row["units_allocated"] if isinstance(inv_row, dict) else inv_row[1]
+        available = on_hand - allocated
+        if quantity > available:
+            return {"status": 400, "body": {"error": f"Insufficient stock. Available: {available}, requested: {quantity}"}}
+        conn.execute("UPDATE inventory SET units_allocated = units_allocated + ?, updated_at=CURRENT_TIMESTAMP WHERE sku_id=?",
+            [quantity, sku_id])
+        conn.execute(
+            "INSERT INTO inventory_movements (sku_id, movement_type, quantity, reference_type, reference_id, notes, user_id) VALUES (?, 'allocation', ?, 'order_item', ?, 'Manual allocation from Stock On Hand', ?)",
+            [sku_id, quantity, order_item_id, current_user["id"]]
+        )
+        oi = conn.execute("SELECT * FROM order_items WHERE id=?", [order_item_id]).fetchone()
+        if oi:
+            cur_produced = oi["produced_quantity"] if isinstance(oi, dict) else oi[5]
+            new_produced = (cur_produced or 0) + quantity
+            conn.execute("UPDATE order_items SET produced_quantity=? WHERE id=?", [new_produced, order_item_id])
+        conn.commit()
+        sse_notify("inventory")
+        sse_notify("orders")
+        return {"status": 200, "body": {"allocated": quantity, "sku_id": sku_id, "order_item_id": order_item_id}}
 
     # ----- STATION CAPACITY -----
     if method == "GET" and path == "/station-capacity":

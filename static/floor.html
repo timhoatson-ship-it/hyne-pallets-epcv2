@@ -839,6 +839,7 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
   const [subAssemblyCount, setSubAssemblyCount] = useState(0);
   const [combinedProgress, setCombinedProgress] = useState(null);
   const [starting, setStarting] = useState(!jobInfo.sessionId);
+  const [qaInterval, setQaInterval] = useState(QA_INTERVAL);
 
   const elapsed = useElapsed(session?.started_at||sessionStart);
   const pauseElapsed = useElapsed(pauseStart);
@@ -898,9 +899,18 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
     api(`/production/combined-progress/${jobInfo.wo.order_item_id}`,{},token).then(d=>setCombinedProgress(d)).catch(()=>{});
   },[sessionId]);
 
+  // Fetch per-SKU QA rate (falls back to zone default)
+  useEffect(()=>{
+    const skuId = jobInfo.sku?.id || jobInfo.wo?.sku_id;
+    if (!skuId) return;
+    api(`/qa-rate/${skuId}`,{},token).then(d=>{
+      if (d && d.effective_rate) setQaInterval(d.effective_rate);
+    }).catch(()=>{});
+  },[jobInfo]);
+
   // QA check logic
   useEffect(()=>{
-    if (pallets>0 && pallets%QA_INTERVAL===0 && pallets!==lastQaAt) {
+    if (pallets>0 && pallets%qaInterval===0 && pallets!==lastQaAt) {
       setQaAlert(true);
       setLastQaAt(pallets);
     }
@@ -993,7 +1003,7 @@ const ActiveJobScreen = ({ token, user, zone, station, sessionStart, jobInfo, on
         <div className="qa-bar" style={{margin:'12px 16px 0',borderRadius:'14px'}}>
           <div>
             <div style={{fontFamily:'Barlow Condensed,sans-serif',fontSize:'22px',fontWeight:800,letterSpacing:'0.05em'}}>🔍 QA CHECK DUE</div>
-            <div style={{fontSize:'16px',opacity:0.9}}>Every {QA_INTERVAL} pallets — check quality now</div>
+            <div style={{fontSize:'16px',opacity:0.9}}>Every {qaInterval} pallets — check quality now</div>
           </div>
           <div style={{display:'flex',gap:'8px',flexShrink:0}}>
             <button onClick={()=>setQaDefectModal(true)}

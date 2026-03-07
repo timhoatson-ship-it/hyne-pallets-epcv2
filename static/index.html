@@ -5200,7 +5200,7 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
               border: kanbanInfo.ring ? '2px solid #991b1b' : kanbanInfo.border || 'none',
             }} title={kanbanLabel} />
             <span style={{fontWeight:800,color:'#07324C',fontSize: compact?14:15,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',cursor:entry.order_id?'pointer':'default',textDecoration:entry.order_id?'underline':'none'}}
-              onClick={() => entry.order_id && setShowOrderModal(true)}>
+              onClick={(e) => { e.stopPropagation(); e.preventDefault(); if(entry.order_id) setShowOrderModal(true); }}>
               {entry.order_number}
             </span>
           </div>
@@ -5302,7 +5302,28 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
     </div>
     {/* Order detail modal */}
     {showOrderModal && entry.order_id && (
-      <OrderDetailModal orderId={entry.order_id} token={token} onClose={() => setShowOrderModal(false)} />
+      <OrderDetailModal orderId={entry.order_id} token={token} onClose={() => setShowOrderModal(false)}
+        extraActions={(order) => (
+          <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+            {entry.truck_id && (
+              <button style={{padding:'6px 14px',borderRadius:6,background:'#fef2f2',color:'#dc2626',border:'1px solid #fecaca',fontWeight:700,fontSize:14,cursor:'pointer'}}
+                onClick={async () => {
+                  if (!(await confirmAction('Unassign this order from its truck? It will return to the intake queue.', { title:'Unassign from Truck', confirmText:'Unassign', danger:true }))) return;
+                  try {
+                    await api('/delivery-log/' + entry.id, {method:'PUT',body:JSON.stringify({truck_id:null,run_id:null})}, token);
+                    toast('Order unassigned from truck','success');
+                    setShowOrderModal(false);
+                  } catch(e) { toast(e.message,'error'); }
+                }}>Unassign from Truck</button>
+            )}
+            <button style={{padding:'6px 14px',borderRadius:6,background:'#eff6ff',color:'#1d4ed8',border:'1px solid #bfdbfe',fontWeight:700,fontSize:14,cursor:'pointer'}}
+              onClick={() => {
+                setShowOrderModal(false);
+                if(onEdit) onEdit(entry);
+              }}>Reschedule / Move Week</button>
+          </div>
+        )}
+      />
     )}
     </>
   );
@@ -6631,7 +6652,7 @@ const DispatchDashboard = ({ token }) => {
                                             <div style={{display:'flex',alignItems:'center',gap:4}}>
                                               <span style={{width:8,height:8,borderRadius:'50%',background:entry.kanban_color||getKanbanColor(entry.kanban_status),flexShrink:0,display:'inline-block'}} title={entry.kanban_label} />
                                               <span style={{fontWeight:800,color:'#07324C',fontSize:14,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis',cursor:entry.order_id?'pointer':'default',textDecoration:entry.order_id?'underline':'none'}}
-                                                onClick={() => entry.order_id && setDispatchOrderModal(entry.order_id)}>{entry.order_number}</span>
+                                                onClick={(e) => { e.stopPropagation(); e.preventDefault(); if(entry.order_id) setDispatchOrderModal(entry.order_id); }}>{entry.order_number}</span>
                                             </div>
                                             <div style={{fontSize:13,color:'#6b7280',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_name}</div>
                                             {entry.requested_delivery_date && <div style={{fontSize:12,color:'#ef4444',fontWeight:700}}>Del: {(() => { try { return new Date(entry.requested_delivery_date+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}); } catch(e) {return entry.requested_delivery_date;} })()}</div>}
@@ -7392,6 +7413,239 @@ const ReportingPage = ({ token }) => {
 // ═══════════════════════════════════════════════════════════════
 // ADMIN PAGE
 // ═══════════════════════════════════════════════════════════════
+// ─── QA CONFIG TAB (P4 Issue 2) ─────────────────────────────────────────
+const QAConfigTab = ({ token }) => {
+  const [qaData, setQaData] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [zoneFilter, setZoneFilter] = useState('');
+  const [search, setSearch] = useState('');
+  const [edits, setEdits] = useState({});
+  const [zoneEdits, setZoneEdits] = useState({});
+  const [saving, setSaving] = useState(false);
+
+  const loadQAConfig = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = await api('/qa-config', {}, token);
+      setQaData(Array.isArray(data) ? data : []);
+    } catch(e) { toast('Failed to load QA config','error'); }
+    setLoading(false);
+  }, [token]);
+
+  useEffect(() => { loadQAConfig(); }, [loadQAConfig]);
+
+  const zones = [...new Map(qaData.filter(d=>d.zone_id).map(d=>[d.zone_id, {id:d.zone_id, name:d.zone_name, qa_interval:d.zone_qa_interval}])).values()];
+
+  const filtered = qaData.filter(d => {
+    if (zoneFilter && String(d.zone_id) !== zoneFilter) return false;
+    if (search) {
+      const q = search.toLowerCase();
+      if (!(d.sku_code||'').toLowerCase().includes(q) && !(d.sku_name||'').toLowerCase().includes(q)) return false;
+    }
+    return true;
+  });
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      const sku_rates = Object.entries(edits).map(([sid, rate]) => ({
+        sku_id: parseInt(sid),
+        qa_sample_rate: rate === '' || rate === null ? null : parseInt(rate)
+      }));
+      const zone_rates = Object.entries(zoneEdits).map(([zid, interval]) => ({
+        zone_id: parseInt(zid),
+        qa_interval: parseInt(interval) || 20
+      }));
+      await api('/qa-config', {method:'PUT',body:JSON.stringify({sku_rates, zone_rates})}, token);
+      toast('QA configuration saved','success');
+      setEdits({});
+      setZoneEdits({});
+      loadQAConfig();
+    } catch(e) { toast(e.message,'error'); }
+    setSaving(false);
+  };
+
+  const hasChanges = Object.keys(edits).length > 0 || Object.keys(zoneEdits).length > 0;
+
+  return (
+    <div style={{maxWidth:900,margin:'0 auto'}}>
+      <div className="hp-card" style={{marginBottom:16}}>
+        <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wider mb-3">QA Inspection Intervals</h2>
+        <p style={{fontSize:15,color:'#6b7280',lineHeight:1.5,marginBottom:12}}>
+          Set how many pallets trigger a QA inspection. Per-SKU rates override the zone default. Leave blank to use the zone default.
+        </p>
+        <div style={{marginBottom:20}}>
+          <div style={{fontSize:13,fontWeight:700,color:'#9ca3af',textTransform:'uppercase',letterSpacing:'0.06em',marginBottom:8}}>Zone Defaults</div>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(180px,1fr))',gap:10}}>
+            {zones.map(z => (
+              <div key={z.id} style={{background:'#f8fafc',borderRadius:8,padding:'10px 14px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+                <span style={{fontWeight:700,color:'#07324C',fontSize:15}}>{z.name}</span>
+                <div style={{display:'flex',alignItems:'center',gap:4}}>
+                  <span style={{fontSize:13,color:'#6b7280'}}>Every</span>
+                  <input type="number" min="1" style={{width:60,padding:'4px 6px',borderRadius:4,border:'1px solid #d1d5db',fontSize:15,textAlign:'center',fontWeight:700}}
+                    value={zoneEdits[z.id] !== undefined ? zoneEdits[z.id] : (z.qa_interval || 20)}
+                    onChange={e => setZoneEdits(prev => ({...prev, [z.id]: e.target.value}))} />
+                  <span style={{fontSize:13,color:'#6b7280'}}>pallets</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div style={{display:'flex',gap:10,marginBottom:12,flexWrap:'wrap'}}>
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search SKU..."
+            style={{flex:1,minWidth:200,padding:'10px 14px',borderRadius:8,border:'1.5px solid #d1d5db',fontSize:16}} />
+          <select value={zoneFilter} onChange={e=>setZoneFilter(e.target.value)}
+            style={{padding:'10px 14px',borderRadius:8,border:'1.5px solid #d1d5db',fontSize:16}}>
+            <option value="">All Zones</option>
+            {zones.map(z => <option key={z.id} value={z.id}>{z.name}</option>)}
+          </select>
+        </div>
+      </div>
+      {loading ? (
+        <div style={{textAlign:'center',padding:40,color:'#9ca3af'}}>Loading QA config...</div>
+      ) : (
+        <div style={{background:'white',borderRadius:12,overflow:'hidden',boxShadow:'0 2px 8px rgba(0,0,0,.07)'}}>
+          <table style={{width:'100%',borderCollapse:'collapse',fontSize:15}}>
+            <thead>
+              <tr style={{background:'#07324C',color:'white'}}>
+                <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>SKU Code</th>
+                <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>Product Name</th>
+                <th style={{padding:'10px 14px',textAlign:'center',fontWeight:700}}>Zone</th>
+                <th style={{padding:'10px 14px',textAlign:'center',fontWeight:700}}>Zone Default</th>
+                <th style={{padding:'10px 14px',textAlign:'center',fontWeight:700}}>SKU Rate</th>
+                <th style={{padding:'10px 14px',textAlign:'center',fontWeight:700}}>Effective</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.slice(0,100).map(d => {
+                const editVal = edits[d.sku_id];
+                const currentRate = editVal !== undefined ? editVal : (d.qa_sample_rate != null ? String(d.qa_sample_rate) : '');
+                const zoneDefault = zoneEdits[d.zone_id] !== undefined ? parseInt(zoneEdits[d.zone_id]) : (d.zone_qa_interval || 20);
+                const effective = currentRate !== '' && currentRate !== null ? parseInt(currentRate) : zoneDefault;
+                return (
+                  <tr key={d.sku_id} style={{borderBottom:'1px solid #f3f4f6'}}>
+                    <td style={{padding:'8px 14px',fontFamily:'monospace',fontWeight:700,color:'#07324C'}}>{d.sku_code}</td>
+                    <td style={{padding:'8px 14px',color:'#374151'}}>{d.sku_name}</td>
+                    <td style={{padding:'8px 14px',textAlign:'center',fontSize:14}}>{d.zone_name || '-'}</td>
+                    <td style={{padding:'8px 14px',textAlign:'center',fontSize:14,color:'#6b7280'}}>{zoneDefault}</td>
+                    <td style={{padding:'8px 14px',textAlign:'center'}}>
+                      <input type="number" min="1" placeholder={String(zoneDefault)}
+                        style={{width:70,padding:'4px 6px',borderRadius:4,border:'1px solid #d1d5db',fontSize:15,textAlign:'center',fontWeight:currentRate!==''?700:400,color:currentRate!==''?'#07324C':'#9ca3af'}}
+                        value={currentRate}
+                        onChange={e => setEdits(prev => ({...prev, [d.sku_id]: e.target.value}))} />
+                    </td>
+                    <td style={{padding:'8px 14px',textAlign:'center',fontWeight:700,color:currentRate!==''&&currentRate!==null?'#7c3aed':'#6b7280'}}>{isNaN(effective)?zoneDefault:effective}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {filtered.length > 100 && <div style={{padding:'12px',textAlign:'center',color:'#9ca3af',fontSize:14}}>Showing first 100 of {filtered.length} SKUs. Use search to narrow.</div>}
+        </div>
+      )}
+      {hasChanges && (
+        <div style={{position:'sticky',bottom:20,marginTop:16,display:'flex',justifyContent:'center'}}>
+          <button onClick={handleSave} disabled={saving}
+            style={{background:'#16a34a',color:'white',border:'none',padding:'12px 32px',borderRadius:10,fontWeight:800,fontSize:17,cursor:saving?'wait':'pointer',boxShadow:'0 4px 12px rgba(22,163,74,0.4)'}}>
+            {saving ? 'Saving...' : 'Save QA Configuration'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── AUDIT LOG TAB (P3 Issue 7) ─────────────────────────────────────────
+const AuditLogTab = ({ token }) => {
+  const [logs, setLogs] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [search, setSearch] = useState('');
+  const [dateFrom, setDateFrom] = useState('');
+  const [dateTo, setDateTo] = useState('');
+  const [entityFilter, setEntityFilter] = useState('');
+
+  const loadLogs = useCallback(async () => {
+    setLoading(true);
+    try {
+      const p = new URLSearchParams();
+      if (search.trim()) p.set('search', search.trim());
+      if (dateFrom) p.set('date_from', dateFrom);
+      if (dateTo) p.set('date_to', dateTo);
+      if (entityFilter) p.set('entity_type', entityFilter);
+      p.set('limit', '200');
+      const data = await api('/audit-log?' + p.toString(), {}, token);
+      setLogs(Array.isArray(data) ? data : []);
+    } catch(e) { toast('Failed to load audit log','error'); }
+    setLoading(false);
+  }, [token, search, dateFrom, dateTo, entityFilter]);
+
+  useEffect(() => { loadLogs(); }, [loadLogs]);
+
+  const fmtTime = (ts) => {
+    if (!ts) return '-';
+    try { return new Date(ts).toLocaleString('en-AU', {day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}); } catch(e) { return ts; }
+  };
+
+  return (
+    <div style={{maxWidth:900,margin:'0 auto'}}>
+      <div className="hp-card" style={{marginBottom:16}}>
+        <h2 className="text-sm font-bold text-gray-500 uppercase tracking-wider mb-4">Audit Log Search</h2>
+        <div style={{display:'flex',gap:10,flexWrap:'wrap',marginBottom:12}}>
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search by WO number, action, user..."
+            onKeyDown={e => e.key === 'Enter' && loadLogs()}
+            style={{flex:2,minWidth:200,padding:'10px 14px',borderRadius:8,border:'1.5px solid #d1d5db',fontSize:16}} />
+          <select value={entityFilter} onChange={e=>setEntityFilter(e.target.value)}
+            style={{padding:'10px 14px',borderRadius:8,border:'1.5px solid #d1d5db',fontSize:16,minWidth:140}}>
+            <option value="">All Types</option>
+            <option value="orders">Orders</option>
+            <option value="order_items">Order Items</option>
+            <option value="production">Production</option>
+            <option value="dispatch">Dispatch</option>
+            <option value="users">Users</option>
+            <option value="system">System</option>
+          </select>
+          <input type="date" value={dateFrom} onChange={e=>setDateFrom(e.target.value)}
+            style={{padding:'10px 14px',borderRadius:8,border:'1.5px solid #d1d5db',fontSize:16}} title="From date" />
+          <input type="date" value={dateTo} onChange={e=>setDateTo(e.target.value)}
+            style={{padding:'10px 14px',borderRadius:8,border:'1.5px solid #d1d5db',fontSize:16}} title="To date" />
+          <button onClick={loadLogs} style={{background:'#07324C',color:'white',border:'none',padding:'10px 18px',borderRadius:8,fontWeight:700,fontSize:15,cursor:'pointer'}}>Search</button>
+        </div>
+      </div>
+      {loading ? (
+        <div style={{textAlign:'center',padding:40,color:'#9ca3af',fontSize:18}}>Loading audit log...</div>
+      ) : logs.length === 0 ? (
+        <div style={{textAlign:'center',padding:40,color:'#9ca3af',fontSize:18}}>No matching audit log entries</div>
+      ) : (
+        <div style={{background:'white',borderRadius:12,overflow:'hidden',boxShadow:'0 2px 8px rgba(0,0,0,.07)'}}>
+          <div style={{fontSize:14,color:'#6b7280',padding:'12px 16px',borderBottom:'1px solid #e2e8f0'}}>{logs.length} entries found</div>
+          <table style={{width:'100%',borderCollapse:'collapse',fontSize:15}}>
+            <thead>
+              <tr style={{background:'#07324C',color:'white'}}>
+                <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>Time</th>
+                <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>User</th>
+                <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>Action</th>
+                <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>Entity</th>
+                <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {logs.map(log => (
+                <tr key={log.id} style={{borderBottom:'1px solid #f3f4f6'}}>
+                  <td style={{padding:'8px 14px',fontSize:14,color:'#6b7280',whiteSpace:'nowrap'}}>{fmtTime(log.created_at)}</td>
+                  <td style={{padding:'8px 14px',fontWeight:600,color:'#07324C'}}>{log.user_name || '-'}</td>
+                  <td style={{padding:'8px 14px'}}><span style={{padding:'2px 8px',borderRadius:4,background:'#f3f4f6',fontSize:13,fontWeight:600,fontFamily:'monospace'}}>{log.action}</span></td>
+                  <td style={{padding:'8px 14px',fontSize:14,color:'#374151'}}>{log.entity_type}{log.entity_id ? ' #'+log.entity_id : ''}</td>
+                  <td style={{padding:'8px 14px',fontSize:14,color:'#6b7280',maxWidth:200,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={log.new_value || log.details || ''}>{log.new_value || log.details || '-'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const AdminPage = ({ token }) => {
   const [tab, setTab] = useState('users');
   const [users, setUsers] = useState([]);
@@ -7639,7 +7893,7 @@ const AdminPage = ({ token }) => {
       <h1 className="text-2xl font-black text-[#07324C]">Admin</h1>
 
       <div className="tab-bar">
-        {['users','zones','costing','email','accounting','skus','trucks','security','purge'].map(t => (
+        {['users','zones','costing','email','accounting','skus','trucks','qa','audit','security','purge'].map(t => (
           <div key={t} className={`tab-item ${tab===t?'active':''}`} onClick={()=>{
             setTab(t);
             if (t==='skus') setTimeout(()=>loadSkus(),0);
@@ -8313,6 +8567,14 @@ const AdminPage = ({ token }) => {
                 </div>
               )}
             </div>
+          )}
+
+          {tab === 'qa' && (
+            <QAConfigTab token={token} />
+          )}
+
+          {tab === 'audit' && (
+            <AuditLogTab token={token} />
           )}
 
           {tab === 'security' && (
@@ -9151,6 +9413,10 @@ const StockOnHandPage = ({ token }) => {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState('');
   const [zoneFilter, setZoneFilter] = useState('');
+  const [stockTab, setStockTab] = useState('inventory');
+  const [movements, setMovements] = useState([]);
+  const [movLoading, setMovLoading] = useState(false);
+  const [allocModal, setAllocModal] = useState(null);
 
   const loadInventory = useCallback(async () => {
     try {
@@ -9160,7 +9426,17 @@ const StockOnHandPage = ({ token }) => {
     finally { setLoading(false); }
   }, [token]);
 
+  const loadMovements = useCallback(async () => {
+    setMovLoading(true);
+    try {
+      const data = await api('/inventory-movements?limit=200', {}, token);
+      setMovements(Array.isArray(data) ? data : []);
+    } catch(e) { toast('Failed to load movements', 'error'); }
+    setMovLoading(false);
+  }, [token]);
+
   useEffect(() => { loadInventory(); }, [loadInventory]);
+  useEffect(() => { if (stockTab === 'movements') loadMovements(); }, [stockTab, loadMovements]);
 
   const filtered = inventory.filter(inv => {
     if (search) {
@@ -9178,7 +9454,12 @@ const StockOnHandPage = ({ token }) => {
     <div style={{padding:'24px'}}>
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'20px',flexWrap:'wrap',gap:'12px'}}>
         <h1 style={{fontFamily:'Barlow Condensed,sans-serif',fontWeight:900,fontSize:'28px',color:'#07324C',margin:0}}>Stock On Hand</h1>
-        <button onClick={loadInventory} style={{background:'#07324C',color:'white',border:'none',padding:'8px 16px',borderRadius:8,fontWeight:700,fontSize:14,cursor:'pointer'}}>Refresh</button>
+        <button onClick={() => { loadInventory(); if(stockTab==='movements') loadMovements(); }} style={{background:'#07324C',color:'white',border:'none',padding:'8px 16px',borderRadius:8,fontWeight:700,fontSize:14,cursor:'pointer'}}>Refresh</button>
+      </div>
+
+      <div className="tab-bar" style={{marginBottom:16}}>
+        <div className={`tab-item ${stockTab==='inventory'?'active':''}`} onClick={()=>setStockTab('inventory')}>Inventory</div>
+        <div className={`tab-item ${stockTab==='movements'?'active':''}`} onClick={()=>setStockTab('movements')}>Movement Log</div>
       </div>
 
       <div style={{display:'flex',gap:'12px',marginBottom:'16px',flexWrap:'wrap'}}>
@@ -9194,6 +9475,7 @@ const StockOnHandPage = ({ token }) => {
         </select>
       </div>
 
+      {stockTab === 'inventory' && (<>
       <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(200px,1fr))',gap:'12px',marginBottom:'20px'}}>
         <div style={{background:'white',borderRadius:12,padding:'16px',boxShadow:'0 2px 8px rgba(0,0,0,.07)',borderLeft:'4px solid #16a34a'}}>
           <div style={{fontSize:14,color:'#6b7280',fontWeight:600}}>Total On Hand</div>
@@ -9228,6 +9510,7 @@ const StockOnHandPage = ({ token }) => {
                 <th style={{padding:'12px 16px',textAlign:'right',fontWeight:700}}>Allocated</th>
                 <th style={{padding:'12px 16px',textAlign:'right',fontWeight:700}}>Available</th>
                 <th style={{padding:'12px 16px',textAlign:'center',fontWeight:700}}>Status</th>
+                <th style={{padding:'12px 16px',textAlign:'center',fontWeight:700}}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -9249,6 +9532,14 @@ const StockOnHandPage = ({ token }) => {
                         {available>0?'In Stock':inv.units_on_hand>0?'Fully Allocated':'No Stock'}
                       </span>
                     </td>
+                    <td style={{padding:'10px 16px',textAlign:'center'}}>
+                      {available > 0 && (
+                        <button onClick={() => setAllocModal({ sku_id: inv.sku_id, sku_code: inv.sku_code, available })}
+                          style={{padding:'4px 10px',borderRadius:6,background:'#eff6ff',color:'#1d4ed8',border:'1px solid #bfdbfe',fontWeight:700,fontSize:13,cursor:'pointer'}}>
+                          Allocate
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 );
               })}
@@ -9256,6 +9547,138 @@ const StockOnHandPage = ({ token }) => {
           </table>
         </div>
       )}
+      </>)}
+
+      {stockTab === 'movements' && (
+        movLoading ? (
+          <div style={{textAlign:'center',padding:40,color:'#9ca3af',fontSize:18}}>Loading movements...</div>
+        ) : movements.length === 0 ? (
+          <div style={{textAlign:'center',padding:40,color:'#9ca3af',fontSize:18}}>No inventory movements recorded yet</div>
+        ) : (
+          <div style={{background:'white',borderRadius:12,overflow:'hidden',boxShadow:'0 2px 8px rgba(0,0,0,.07)'}}>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:15}}>
+              <thead>
+                <tr style={{background:'#07324C',color:'white'}}>
+                  <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>Time</th>
+                  <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>SKU</th>
+                  <th style={{padding:'10px 14px',textAlign:'center',fontWeight:700}}>Type</th>
+                  <th style={{padding:'10px 14px',textAlign:'right',fontWeight:700}}>Qty</th>
+                  <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>Reference</th>
+                  <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>User</th>
+                  <th style={{padding:'10px 14px',textAlign:'left',fontWeight:700}}>Notes</th>
+                </tr>
+              </thead>
+              <tbody>
+                {movements.map(mv => {
+                  const typeColors = {qa_approved:'#16a34a',production_in:'#059669',dispatch_out:'#dc2626',allocation:'#f59e0b',deallocation:'#3b82f6',manual_adjust:'#6b7280'};
+                  const typeLabels = {qa_approved:'QA Approved',production_in:'Production In',dispatch_out:'Dispatched',allocation:'Allocated',deallocation:'Deallocated',manual_adjust:'Manual'};
+                  return (
+                    <tr key={mv.id} style={{borderBottom:'1px solid #f3f4f6'}}>
+                      <td style={{padding:'8px 14px',fontSize:14,color:'#6b7280',whiteSpace:'nowrap'}}>{mv.created_at ? new Date(mv.created_at).toLocaleString('en-AU',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '-'}</td>
+                      <td style={{padding:'8px 14px',fontFamily:'monospace',fontWeight:700,color:'#07324C'}}>{mv.sku_code || '-'}</td>
+                      <td style={{padding:'8px 14px',textAlign:'center'}}>
+                        <span style={{padding:'2px 8px',borderRadius:4,fontSize:13,fontWeight:700,background:(typeColors[mv.movement_type]||'#6b7280')+'18',color:typeColors[mv.movement_type]||'#6b7280'}}>
+                          {typeLabels[mv.movement_type] || mv.movement_type}
+                        </span>
+                      </td>
+                      <td style={{padding:'8px 14px',textAlign:'right',fontWeight:700,color:mv.quantity>=0?'#16a34a':'#dc2626'}}>{mv.quantity >= 0 ? '+' : ''}{mv.quantity}</td>
+                      <td style={{padding:'8px 14px',fontSize:14,color:'#6b7280'}}>{mv.reference_type ? mv.reference_type + ' #' + mv.reference_id : '-'}</td>
+                      <td style={{padding:'8px 14px',fontSize:14,color:'#374151'}}>{mv.user_name || '-'}</td>
+                      <td style={{padding:'8px 14px',fontSize:14,color:'#6b7280',maxWidth:180,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}} title={mv.notes||''}>{mv.notes || '-'}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )
+      )}
+
+      {allocModal && <StockAllocateModal sku={allocModal} token={token} onClose={() => setAllocModal(null)} onSave={() => { setAllocModal(null); loadInventory(); }} />}
+    </div>
+  );
+};
+
+// ─── STOCK ALLOCATE MODAL (P4 Issue 8) ──────────────────────────────────
+const StockAllocateModal = ({ sku, token, onClose, onSave }) => {
+  const [orders, setOrders] = useState([]);
+  const [selectedItem, setSelectedItem] = useState('');
+  const [qty, setQty] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [loadingOrders, setLoadingOrders] = useState(true);
+
+  useEffect(() => {
+    const load = async () => {
+      try {
+        const data = await api('/orders', {}, token);
+        const withItems = [];
+        for (const o of (Array.isArray(data) ? data : [])) {
+          if (['T','C','R','P'].includes(o.status)) {
+            const items = o.items || o.order_items || [];
+            for (const it of items) {
+              if (String(it.sku_id) === String(sku.sku_id)) {
+                const remaining = (it.quantity||0) - (it.produced_quantity||0);
+                if (remaining > 0) {
+                  withItems.push({ order_number: o.order_number, order_item_id: it.id, sku_code: it.sku_code || it.product_name, quantity: it.quantity, produced: it.produced_quantity || 0, remaining });
+                }
+              }
+            }
+          }
+        }
+        setOrders(withItems);
+      } catch(e) { console.error(e); }
+      setLoadingOrders(false);
+    };
+    load();
+  }, [sku, token]);
+
+  const handleAllocate = async () => {
+    if (!selectedItem || !qty || parseInt(qty) <= 0) { toast('Select an order item and enter quantity', 'error'); return; }
+    setSaving(true);
+    try {
+      await api('/inventory/allocate-to-order', {method:'POST',body:JSON.stringify({ sku_id: sku.sku_id, order_item_id: parseInt(selectedItem), quantity: parseInt(qty) })}, token);
+      toast('Stock allocated successfully', 'success');
+      onSave();
+    } catch(e) { toast(e.message, 'error'); }
+    setSaving(false);
+  };
+
+  return (
+    <div className="modal-backdrop" onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:900,display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+      <div className="modal-card" onClick={e=>e.stopPropagation()} style={{background:'white',borderRadius:16,padding:24,width:'100%',maxWidth:480,boxShadow:'0 20px 60px rgba(0,0,0,0.3)'}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+          <div style={{fontSize:20,fontWeight:900,color:'#07324C'}}>Allocate Stock: {sku.sku_code}</div>
+          <button onClick={onClose} style={{background:'none',border:'none',fontSize:28,color:'#9ca3af',cursor:'pointer',lineHeight:1}}>x</button>
+        </div>
+        <div style={{fontSize:15,color:'#6b7280',marginBottom:16}}>Available: <strong style={{color:'#16a34a'}}>{sku.available}</strong> units</div>
+        {loadingOrders ? (
+          <div style={{textAlign:'center',padding:20,color:'#9ca3af'}}>Loading eligible orders...</div>
+        ) : orders.length === 0 ? (
+          <div style={{textAlign:'center',padding:20,color:'#9ca3af'}}>No open orders found for this SKU</div>
+        ) : (<>
+          <div style={{marginBottom:12}}>
+            <label style={{fontSize:14,fontWeight:700,color:'#374151',marginBottom:4,display:'block'}}>Allocate to Order Item</label>
+            <select value={selectedItem} onChange={e=>setSelectedItem(e.target.value)}
+              style={{width:'100%',padding:'10px 14px',borderRadius:8,border:'1.5px solid #d1d5db',fontSize:16}}>
+              <option value="">Select order item...</option>
+              {orders.map(o => (
+                <option key={o.order_item_id} value={o.order_item_id}>
+                  {o.order_number} - {o.sku_code} (need {o.remaining})
+                </option>
+              ))}
+            </select>
+          </div>
+          <div style={{marginBottom:16}}>
+            <label style={{fontSize:14,fontWeight:700,color:'#374151',marginBottom:4,display:'block'}}>Quantity</label>
+            <input type="number" min="1" max={sku.available} value={qty} onChange={e=>setQty(e.target.value)}
+              style={{width:'100%',padding:'10px 14px',borderRadius:8,border:'1.5px solid #d1d5db',fontSize:16}} placeholder="Enter quantity..." />
+          </div>
+          <button onClick={handleAllocate} disabled={saving}
+            style={{width:'100%',background:'#16a34a',color:'white',border:'none',padding:'12px',borderRadius:8,fontWeight:800,fontSize:16,cursor:saving?'wait':'pointer'}}>
+            {saving ? 'Allocating...' : 'Allocate Stock'}
+          </button>
+        </>)}
+      </div>
     </div>
   );
 };
