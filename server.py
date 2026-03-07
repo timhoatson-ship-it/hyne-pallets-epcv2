@@ -5169,7 +5169,7 @@ def dispatch(method, path, params, body, conn):
         zone_id = params.get("zone_id")
         if not station_id or not zone_id:
             return {"status": 400, "body": {"error": "station_id and zone_id required"}}
-        # Get scheduled work orders for this station
+        # Get scheduled work orders for this station (exclude items with active/paused production sessions)
         scheduled = rows_to_list(conn.execute("""
             SELECT se.*, oi.sku_code, oi.product_name, oi.quantity, oi.produced_quantity, oi.drawing_number,
                    oi.status as item_status, oi.id as order_item_id,
@@ -5182,6 +5182,10 @@ def dispatch(method, path, params, body, conn):
             LEFT JOIN skus s ON s.id=oi.sku_id
             WHERE se.station_id=? AND se.status IN ('planned','in_progress')
               AND oi.status IN ('R','P')
+              AND NOT EXISTS (
+                  SELECT 1 FROM production_sessions ps
+                  WHERE ps.order_item_id=oi.id AND ps.status IN ('active','paused')
+              )
             ORDER BY se.priority DESC, se.scheduled_date ASC
         """, [station_id]).fetchall())
         # Get active/paused sessions at this station
