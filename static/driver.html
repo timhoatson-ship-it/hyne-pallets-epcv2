@@ -182,6 +182,12 @@ const fmtMins = (mins) => {
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 };
 
+// Get today's date in local timezone as YYYY-MM-DD (not UTC)
+const getLocalDate = () => {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+};
+
 const STAGE_LABELS = {
   waiting_to_load: "Waiting to Load",
   being_loaded: "Being Loaded",
@@ -1848,7 +1854,7 @@ const RunSheetView = ({ shift, token, onClose }) => {
   const load = async () => {
     setLoading(true);
     try {
-      const today = new Date().toISOString().split("T")[0];
+      const today = getLocalDate();
       // Try v2 first, fallback to v1
       let data;
       try {
@@ -2554,7 +2560,7 @@ const DriverApp = ({ user, token, shift, onClockOff }) => {
 
   const loadData = useCallback(async () => {
     try {
-      const today = new Date().toISOString().split("T")[0];
+      const today = getLocalDate();
       const data = await api(`/driver/load?truck_id=${shift.truck_id}&date=${today}`, {}, token);
       setDeliveries(data || []);
       const upcoming_data = await api(`/driver/upcoming?truck_id=${shift.truck_id}&date=${today}`, {}, token);
