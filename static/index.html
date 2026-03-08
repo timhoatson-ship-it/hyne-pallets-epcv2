@@ -5217,7 +5217,7 @@ const DispatchCard = ({ entry, trucks, onAssign, onAction, onDragStart, onToggle
               </span>
             )}
           </div>
-          <div style={{fontSize: compact?13:14,color:'#6b7280',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_name || '\u2014'}
+          <div style={{fontSize: compact?13:14,color:'#6b7280',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_name || '\u2014'}</div>
           {!compact && entry.client_address && <div style={{fontSize:13,color:'#9ca3af',marginTop:1,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{entry.client_address}</div>}
           {(entry.requested_delivery_date || entry.eta_date) && (
             <div style={{fontSize:12,color:'#ef4444',fontWeight:700,marginTop:1}}>Del: {(() => { const d = entry.requested_delivery_date || entry.eta_date; try { return new Date(d+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}); } catch(e) {return d;} })()}</div>
