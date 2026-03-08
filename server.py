@@ -4324,14 +4324,30 @@ def dispatch(method, path, params, body, conn):
         conn.commit()
         # Sync parent order status from item statuses
         try:
-            sync_order_status(conn, row["order_id"])
+            new_order_status = sync_order_status(conn, row["order_id"])
         except Exception:
-            pass
+            new_order_status = None
         # Update kanban statuses for the parent order
         try:
             update_kanban_statuses(conn, row["order_id"])
         except Exception:
             pass
+        # If item reached F, check if ALL items are now F → auto-create delivery_log
+        if new_status == 'F' or new_order_status == 'F':
+            oid = row["order_id"]
+            all_items = conn.execute("SELECT status FROM order_items WHERE order_id=?", [oid]).fetchall()
+            all_finished = all(r[0] in ('F', 'dispatched', 'delivered', 'collected') for r in all_items) if all_items else False
+            if all_finished:
+                existing_dl = conn.execute("SELECT id FROM delivery_log WHERE order_id=?", [oid]).fetchone()
+                if not existing_dl:
+                    order_row_dl = conn.execute("SELECT * FROM orders WHERE id=?", [oid]).fetchone()
+                    delivery_type = (order_row_dl["delivery_type"] if order_row_dl else None) or "delivery"
+                    conn.execute(
+                        "INSERT INTO delivery_log (order_id, status, delivery_type, notes, created_at) VALUES (?, 'pending', ?, 'Auto-created: all items reached production complete', CURRENT_TIMESTAMP)",
+                        [oid, delivery_type]
+                    )
+                    conn.commit()
+                    sse_notify("dispatch")
         updated = conn.execute("SELECT * FROM order_items WHERE id=?", [iid]).fetchone()
         sse_notify("orders")
         sse_notify("docking")
